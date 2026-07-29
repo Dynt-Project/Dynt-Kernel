@@ -10,6 +10,11 @@ Date: 29 July 2026
 This directory contains the x86_64 port of the kernel.  
 It is designed for **UEFI** systems and includes support for the **Limine** bootloader as well as Multiboot.
 
+------------------------------------------------------------------------------------------------------------------------------------------
+[IMPORTANT]: As for now (July 29th) the kernel only contains the provided code, future updates such as drivers, bootloader, terminal etc.
+is espected to be added past July 31st.
+------------------------------------------------------------------------------------------------------------------------------------------
+
 ## Features
 
 ----- Added July 26th ------
