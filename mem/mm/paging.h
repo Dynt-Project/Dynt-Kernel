@@ -31,6 +31,10 @@ uint64_t paging_new_address_space(void);
 // frees a whole user address space (table pages AND all mapped frames)
 void paging_free_address_space(uint64_t cr3);
 
+// copies every user mapping from src_cr3 into dst_cr3 (new frames,
+// page contents copied). used by fork(). returns false on OOM.
+bool paging_clone_user_space(uint64_t src_cr3, uint64_t dst_cr3);
+
 // maps a single 4 KiB page at vaddr >= PAGING_USER_BASE
 bool paging_map(uint64_t cr3, uint64_t vaddr, uint64_t phys, uint64_t flags);
 

@@ -125,6 +125,89 @@ void paging_free_address_space(uint64_t cr3)
     free_user_tree(cr3);
 }
 
+bool paging_clone_user_space(uint64_t src_cr3, uint64_t dst_cr3)
+{
+    if (!src_cr3 || !dst_cr3)
+        return false;
+
+    uint64_t *spml4 = (uint64_t *)src_cr3;
+    uint64_t *dpml4 = (uint64_t *)dst_cr3;
+
+    for (int a = 0; a < 512; a++)
+    {
+        if (!(spml4[a] & 1))
+            continue;
+
+        uint64_t *spdpt = (uint64_t *)(spml4[a] & ~0xFFFULL);
+
+        for (int b = 0; b < 512; b++)
+        {
+            if (!(spdpt[b] & 1))
+                continue;
+
+            uint64_t *spd = (uint64_t *)(spdpt[b] & ~0xFFFULL);
+
+            for (int c = 0; c < 512; c++)
+            {
+                if (!(spd[c] & 1))
+                    continue;
+
+                if (!(spd[c] & PAGING_FLAG_USER))
+                    continue;
+
+                uint64_t base = ((uint64_t)a << 39) | ((uint64_t)b << 30) |
+                                ((uint64_t)c << 21);
+
+                if (spd[c] & PAGING_FLAG_LARGE)
+                {
+                    uint64_t srcp = spd[c] & ~0x1FFFFFULL;
+
+                    for (int k = 0; k < 512; k++)
+                    {
+                        uint64_t frame = pmm_alloc_frame();
+                        if (!frame)
+                            return false;
+                        pmm_zero_page(frame);
+                        k_memcpy((void *)frame, (void *)(srcp + k * PAGING_PAGE),
+                                 PAGING_PAGE);
+                        if (!paging_map(dst_cr3, base + k * PAGING_PAGE, frame,
+                                        PAGING_FLAG_USER | PAGING_FLAG_WRITABLE))
+                            return false;
+                    }
+                    continue;
+                }
+
+                uint64_t *spt = (uint64_t *)(spd[c] & ~0xFFFULL);
+
+                for (int k = 0; k < 512; k++)
+                {
+                    if (!(spt[k] & 1))
+                        continue;
+                    if (!(spt[k] & PAGING_FLAG_USER))
+                        continue;
+
+                    uint64_t vaddr = base + k * PAGING_PAGE;
+                    uint64_t srcp = spt[k] & ~0xFFFULL;
+                    uint64_t frame = pmm_alloc_frame();
+
+                    if (!frame)
+                        return false;
+
+                    pmm_zero_page(frame);
+                    k_memcpy((void *)frame, (void *)srcp, PAGING_PAGE);
+
+                    if (!paging_map(dst_cr3, vaddr, frame,
+                                    PAGING_FLAG_USER | PAGING_FLAG_WRITABLE))
+                        return false;
+                }
+            }
+        }
+    }
+
+    (void)dpml4;
+    return true;
+}
+
 bool paging_map(uint64_t cr3, uint64_t vaddr, uint64_t phys, uint64_t flags)
 {
     if (vaddr < PAGING_USER_BASE || (vaddr & 0xFFF) || (phys & 0xFFF))

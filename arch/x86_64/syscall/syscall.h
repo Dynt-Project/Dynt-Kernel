@@ -44,6 +44,9 @@ struct __attribute__((packed)) syscall_regs_t {
 #define SYS_SEEK      13
 #define SYS_GETTICKS  14
 #define SYS_SETFSBASE 15
+#define SYS_FORK      16
+#define SYS_EXECVE    17
+#define SYS_WAITPID   18
 
 #ifdef __cplusplus
 extern "C" {

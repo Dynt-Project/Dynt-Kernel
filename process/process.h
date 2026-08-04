@@ -32,6 +32,7 @@ typedef enum process_state
 {
     PROC_READY,
     PROC_RUNNING,
+    PROC_BLOCKED,
     PROC_ZOMBIE,
 } process_state_t;
 
@@ -45,6 +46,21 @@ typedef struct process
     uint64_t fs_base;      // FS segment base (mlibc TCB), restored on switch
     uint64_t mmap_cursor;  // bump cursor for anonymous user mappings
     proc_file_t files[PROCESS_MAX_FDS];
+
+    // per-process kernel stack: syscalls and IRQs run on this stack, so a
+    // process blocked inside a syscall can be switched out and resumed
+    // without clobbering another process's stack frames
+    uint64_t kernel_stack_top;
+    uint64_t saved_kernel_rsp;  // nonzero while blocked in a syscall
+    uint64_t user_rsp;          // gs:16 saved for the blocked syscall
+
+    // fork/waitpid/zombie tracking
+    int32_t exit_status;
+    bool waiting;          // blocked in SYS_WAITPID
+    struct process *parent;
+    struct process *children;
+    struct process *next_sibling;
+
     // full saved user context: general registers + the iretq frame
     // (rip/cs/rflags/user_rsp/ss). the scheduler copies the interrupt
     // frame here on preempt and back into the frame on switch-in
@@ -65,6 +81,27 @@ process_t *process_create(const char *name);
 // choosing a random PIE base and mapping a user stack. returns false on
 // any error (leaves the process reusable)
 bool process_load_elf(process_t *proc, const char *path);
+
+// replaces the caller's image with the program at `path` (execve):
+// frees the old address space, maps the new image and builds a user
+// stack with argv/envp. argv/envp are user pointers read through the
+// current cr3. returns false on any error (process unchanged... on
+// partial failure the old image may already be gone - not used that way)
+bool process_execve(process_t *proc, const char *path, char *const argv[],
+                    char *const envp[]);
+
+// fork clone: copies the address space, file table and user context.
+// returns the child pcb (enqueued nowhere yet) or 0
+process_t *process_fork(void);
+
+// finds a zombie child (pid == 0 means any), 0 if none
+process_t *process_find_zombie_child(process_t *parent, uint64_t pid);
+
+// removes `child` from the parent's children list and destroys it
+void process_reap_child(process_t *parent, process_t *child);
+
+// attaches `child` to `parent`'s children list (used at fork time)
+void process_link_child(process_t *parent, process_t *child);
 
 // sets the initial ring3 registers (full context, so a preempted
 // process can be restored from ctx even on its very first run)
