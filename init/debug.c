@@ -95,6 +95,54 @@ static void debug_vprintf(const char *fmt,
 
         switch (*fmt)
         {
+            case 'l':
+            case 'z':
+            {
+                // length modifier: %l[u|x] %ll[u|x] %z[u|x]
+                bool long_long = false;
+                if (*fmt == 'l' && fmt[1] == 'l')
+                {
+                    long_long = true;
+                    fmt++;
+                }
+
+                fmt++;
+                if (*fmt == 'u')
+                {
+                    if (long_long)
+                        debug_put_u64((uint64_t)va_arg(args, unsigned long long),
+                                      10, false);
+                    else
+                        debug_put_u64((uint64_t)va_arg(args, unsigned long),
+                                      10, false);
+                }
+                else if (*fmt == 'x')
+                {
+                    if (long_long)
+                        debug_put_u64((uint64_t)va_arg(args, unsigned long long),
+                                      16, false);
+                    else
+                        debug_put_u64((uint64_t)va_arg(args, unsigned long),
+                                      16, false);
+                }
+                else if (*fmt == 'X')
+                {
+                    if (long_long)
+                        debug_put_u64((uint64_t)va_arg(args, unsigned long long),
+                                      16, true);
+                    else
+                        debug_put_u64((uint64_t)va_arg(args, unsigned long),
+                                      16, true);
+                }
+                else
+                {
+                    debug_putc('%');
+                    debug_putc('l');
+                    debug_putc(*fmt);
+                }
+                break;
+            }
+
             case 'c':
                 debug_putc((char)va_arg(args, int));
                 break;

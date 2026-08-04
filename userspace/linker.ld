@@ -1,14 +1,14 @@
 /*
- * Userspace linker script — places all sections at 0x2000000 (32 MiB)
- * which is beyond the kernel heap and within the identity-mapped 1 GiB.
- * The kernel ELF loader copies PT_LOAD segments directly to their vaddr.
+ * Userspace linker script — PIE layout. The kernel ELF loader picks a
+ * free base (1-1.5 GiB, per-process) and applies the R_X86_64_RELATIVE
+ * relocations itself, so no userspace dynamic loader is needed.
  */
 
 ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x2000000;
+    . = SIZEOF_HEADERS;
 
     .text : ALIGN(4K)
     {
@@ -18,6 +18,11 @@ SECTIONS
     .rodata : ALIGN(4K)
     {
         *(.rodata*)
+    }
+
+    .data.rel.ro : ALIGN(4K)
+    {
+        *(.data.rel.ro*)
     }
 
     .data : ALIGN(4K)

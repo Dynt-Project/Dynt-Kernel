@@ -1,133 +1,165 @@
+// Preemptive round-robin scheduler for user processes.
+//
+// The timer IRQ fires on the per-CPU interrupt stack.  In user mode the
+// frame carries the whole user context (GP registers + iretq frame), so
+// switching is: save the frame into the current pcb, pick the next ready
+// process, load its cr3 and copy its saved context back into the frame
+// before iretq.  This preserves every register across a preempt.
+
 #include "scheduler.h"
 
-#include "../mem/lib/memory.h"
-#include "../mem/mm/kheap.h"
 #include "../arch/x86_64/cpu/control_regs.h"
+#include "../arch/x86_64/cpu/cpu.h"
+#include "../arch/x86_64/syscall/usermode.h"
+#include "../mem/lib/memory.h"
 
-#define SCHED_DEFAULT_WEIGHT 1024
-#define BORE_BURST_SHIFT 20
-#define BORE_MAX_BURST_SCORE 39
+#define SCHED_QUANTUM 5  // ticks before yielding (100 Hz -> 50 ms)
 
-static sched_task_t *runqueue;
-static sched_task_t *current_task;
-static uint64_t next_task_id;
-static uint32_t task_count;
-
-static uint32_t bore_score(uint64_t burst_runtime)
-{
-    uint32_t score = 0;
-
-    while (burst_runtime > (1ULL << BORE_BURST_SHIFT) &&
-           score < BORE_MAX_BURST_SCORE)
-    {
-        burst_runtime >>= 1;
-        score++;
-    }
-
-    return score;
-}
-
-static uint64_t effective_vruntime(const sched_task_t *task)
-{
-    return task->vruntime + ((uint64_t)task->burst_score * 1000000ULL);
-}
+static process_t *runqueue;
+static uint32_t proc_count;
 
 void scheduler_init(void)
 {
     runqueue = 0;
-    current_task = 0;
-    next_task_id = 1;
-    task_count = 0;
+    proc_count = 0;
 }
 
-sched_task_t *scheduler_create_kernel_task(const char *name,
-                                           void (*entry)(void),
-                                           void *stack_top)
+void scheduler_enqueue(process_t *proc)
 {
-    sched_task_t *task = (sched_task_t *)kheap_alloc(sizeof(sched_task_t), 16);
+    if (!proc)
+        return;
 
-    if (!task || !entry || !stack_top)
+    proc->state = PROC_READY;
+    proc->next = runqueue;
+    runqueue = proc;
+    proc_count++;
+}
+
+static void unlink(process_t *proc)
+{
+    process_t **link = &runqueue;
+
+    while (*link)
+    {
+        if (*link == proc)
+        {
+            *link = proc->next;
+            proc_count--;
+            return;
+        }
+        link = &(*link)->next;
+    }
+}
+
+static process_t *pick_next(process_t *skip)
+{
+    if (!runqueue)
         return 0;
 
-    task->id = next_task_id++;
-    k_strncpy(task->name, name ? name : "kernel-task", sizeof(task->name));
-    task->state = SCHED_TASK_READY;
-    task->weight = SCHED_DEFAULT_WEIGHT;
-    task->context.rsp = (uint64_t)stack_top;
-    task->context.rip = (uint64_t)entry;
-    task->context.rflags = 0x202;
-    task->context.cr3 = read_cr3();
-    task_count++;
+    process_t *start = runqueue;
+    process_t *p = start;
 
-    return task;
+    do
+    {
+        if (p->state == PROC_READY && p != skip)
+            return p;
+        p = p->next ? p->next : runqueue;
+    } while (p != start);
+
+    return 0;
 }
 
-void scheduler_enqueue(sched_task_t *task)
+void scheduler_timer_tick(registers_t *regs)
 {
-    if (!task || task->state == SCHED_TASK_DEAD)
+    // only preempt user mode; a syscall or kernel handler must be atomic
+    if (regs->cs != 0x23)
         return;
 
-    task->state = SCHED_TASK_READY;
-    task->next = runqueue;
-    runqueue = task;
-}
+    process_t *cur = process_current();
 
-sched_task_t *scheduler_pick_next(void)
-{
-    sched_task_t *best = 0;
-    sched_task_t *prev = 0;
-    sched_task_t *best_prev = 0;
-
-    for (sched_task_t *task = runqueue; task; task = task->next)
+    if (cur && cur->state == PROC_RUNNING)
     {
-        if (task->state != SCHED_TASK_READY)
-        {
-            prev = task;
-            continue;
-        }
+        cur->ticks++;
+        cur->ctx = *regs;
 
-        if (!best || effective_vruntime(task) < effective_vruntime(best))
-        {
-            best = task;
-            best_prev = prev;
-        }
-
-        prev = task;
+        if (cur->ticks < SCHED_QUANTUM)
+            return;
     }
 
-    if (!best)
-        return current_task;
+    process_t *next = pick_next(cur);
 
-    if (best_prev)
-        best_prev->next = best->next;
-    else
-        runqueue = best->next;
-
-    best->next = 0;
-    best->state = SCHED_TASK_RUNNING;
-    current_task = best;
-    return best;
-}
-
-void scheduler_tick(uint64_t elapsed_ns)
-{
-    if (!current_task || current_task->state != SCHED_TASK_RUNNING)
+    if (!next || next == cur)
         return;
 
-    current_task->runtime_ns += elapsed_ns;
-    current_task->burst_runtime += elapsed_ns;
-    current_task->burst_score = bore_score(current_task->burst_runtime);
+    if (cur)
+    {
+        cur->ticks = 0;
+        cur->state = PROC_READY;
+    }
 
-    uint32_t weight = current_task->weight ? current_task->weight : SCHED_DEFAULT_WEIGHT;
-    current_task->vruntime += (elapsed_ns * SCHED_DEFAULT_WEIGHT) / weight;
+    next->ticks = 0;
+    next->state = PROC_RUNNING;
+    process_set_current(next);
+
+    write_cr3(next->cr3);
+
+    *regs = next->ctx;
 }
 
-uint32_t scheduler_task_count(void)
+[[noreturn]] void scheduler_exit_current(void)
 {
-    return task_count;
+    process_t *cur = process_current();
+
+    if (cur)
+    {
+        unlink(cur);
+        process_set_current(0);
+        process_destroy(cur);
+    }
+
+    process_t *next = pick_next(0);
+
+    if (!next)
+    {
+        cli();
+        for (;;)
+        {
+            hlt();
+        }
+    }
+
+    next->ticks = 0;
+    next->state = PROC_RUNNING;
+    process_set_current(next);
+
+    write_cr3(next->cr3);
+    usermode_resume_full(&next->ctx);
 }
 
-sched_task_t *scheduler_current(void)
+void scheduler_list(sched_list_cb cb, void *user)
 {
-    return current_task;
+    if (!cb)
+        return;
+
+    for (process_t *p = runqueue; p; p = p->next)
+    {
+        const char *state = "ready";
+
+        if (p->state == PROC_RUNNING)
+            state = "running";
+        else if (p->state == PROC_ZOMBIE)
+            state = "zombie";
+
+        cb(p->pid, p->name, state, user);
+    }
+}
+
+uint32_t scheduler_process_count(void)
+{
+    return proc_count;
+}
+
+process_t *scheduler_current(void)
+{
+    return process_current();
 }

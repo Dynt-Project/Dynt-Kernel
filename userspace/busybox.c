@@ -76,7 +76,7 @@ static int applet_ls(int argc, char **argv)
 static int applet_help(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    puts("Dynt-Kernel BusyBox v1.0");
+    puts("Dynt-Kernel v1.0");
     puts("Available commands:");
     puts("  echo [text]    - print text");
     puts("  cat <file>     - print file contents");
@@ -89,7 +89,9 @@ static int applet_help(int argc, char **argv)
     puts("  true           - exit 0");
     puts("  false          - exit 1");
     puts("  yes [text]     - repeat text forever");
-    puts("  exec <file>    - run a userspace program");
+    puts("  sleep <ms>     - wait ms milliseconds");
+    puts("  ps             - list running processes");
+    puts("  exec <file>    - spawn a userspace program");
     puts("  exit           - exit shell");
     return 0;
 }
@@ -152,6 +154,35 @@ static int applet_exit(int argc, char **argv)
     return 0;
 }
 
+static int applet_sleep(int argc, char **argv)
+{
+    if (argc < 2)
+        return 1;
+
+    int ms = 0;
+    for (const char *p = argv[1]; *p; p++)
+        ms = ms * 10 + (*p - '0');
+
+    syscall1(SYS_SLEEP, ms);
+    return 0;
+}
+
+static int applet_ps(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    static char buf[1024];
+
+    long ret = syscall2(SYS_PS, (long)buf, sizeof(buf));
+    if (ret < 0)
+    {
+        write("ps: failed\n", 11);
+        return 1;
+    }
+
+    write(buf, (unsigned long)ret);
+    return 0;
+}
+
 static int applet_exec(int argc, char **argv)
 {
     if (argc < 2)
@@ -195,6 +226,8 @@ static const struct applet applets[] =
     { "true",     applet_true },
     { "false",    applet_false },
     { "yes",      applet_yes },
+    { "sleep",    applet_sleep },
+    { "ps",       applet_ps },
     { "exit",     applet_exit },
     { "exec",     applet_exec },
     { 0, 0 }
@@ -242,17 +275,14 @@ static void shell_loop(void)
     static char line[MAX_LINE];
     static char cmd[MAX_CMD];
 
+    write("dynt# ", 6);
+
     for (;;)
     {
-        write("dynt# ", 6);
-
-        /* Read a line from keyboard */
+        /* Read a line from keyboard (non-blocking) */
         long n = read(line, sizeof(line) - 1);
         if (n <= 0)
-        {
-            write("\n", 1);
             continue;
-        }
 
         line[n] = 0;
 
@@ -284,6 +314,8 @@ static void shell_loop(void)
             write(argv[0], strlen(argv[0]));
             write(": command not found\n", 20);
         }
+
+        write("dynt# ", 6);
     }
 }
 

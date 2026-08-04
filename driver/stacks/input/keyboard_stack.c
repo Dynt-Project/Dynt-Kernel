@@ -5,6 +5,8 @@
 
 #include "keyboard_stack.h"
 
+#include "../../init/debug.h"
+
 static bool key_state[KEYBOARD_MAX_KEYS];
 
 static bool shift;
@@ -88,6 +90,17 @@ void keyboard_report_key(uint16_t key, bool pressed)
         queue[head]=e;
         head=next;
     }
+
+    // canonical line input: only key presses produce characters
+    if (!pressed)
+        return;
+
+    if (key == KEY_ENTER)
+        tty_input_char('\n');
+    else if (key == KEY_BACKSPACE)
+        tty_input_char(0x08);
+    else if (e.ascii)
+        tty_input_char(e.ascii);
 }
 
 //returns the next queued char, 0 if the queue is empty
@@ -112,6 +125,62 @@ bool keyboard_poll_event(keyboard_event_t *e)
     tail=(tail+1)%KEYBOARD_QUE_SIZE;
 
     return true;
+}
+
+/* ---- canonical line input ---- */
+
+static char tty_line[TTY_LINE_MAX];
+static int tty_len;
+static bool tty_ready;
+
+void tty_input_char(char c)
+{
+    // a line is already finished but not consumed yet - don't extend it
+    if (tty_ready)
+        return;
+
+    if (c == '\n')
+    {
+        tty_line[tty_len] = 0;
+        tty_ready = true;
+        debug_putc('\n');
+        return;
+    }
+
+    if (c == 0x08 || c == 0x7F)  // backspace
+    {
+        if (tty_len > 0)
+        {
+            tty_len--;
+            tty_line[tty_len] = 0;
+            debug_puts("\b \b");
+        }
+        return;
+    }
+
+    if (c >= 0x20 && tty_len < TTY_LINE_MAX - 1)
+    {
+        tty_line[tty_len++] = c;
+        debug_putc(c);
+    }
+}
+
+int tty_getline(char *buf, int size)
+{
+    if (!tty_ready)
+        return 0;
+
+    int n = tty_len;
+    if (n > size - 1)
+        n = size - 1;
+
+    for (int i = 0; i < n; i++)
+        buf[i] = tty_line[i];
+
+    buf[n] = 0;
+    tty_len = 0;
+    tty_ready = false;
+    return n;
 }
 
 // translates a scancode set 1 keycode into an ascii char

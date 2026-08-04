@@ -42,6 +42,7 @@ struct __attribute__((packed)) mb2_mmap_entry
     uint64_t addr;
     uint64_t length;
     uint32_t type;
+    uint32_t reserved;  // multiboot2 mmap entries are 24 bytes
 };
 
 struct __attribute__((packed)) mb2_framebuffer_tag

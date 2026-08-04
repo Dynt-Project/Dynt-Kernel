@@ -43,15 +43,15 @@ LDFLAGS    := -ffreestanding \
               -no-pie \
               -lgcc
 
-# Userspace build flags
-USR_CFLAGS := -static -nostdlib -ffreestanding -fno-pie -fno-pic \
-              -fno-stack-protector -mno-red-zone -mcmodel=large \
-              -O2 -Wall -Wextra -I$(USR_DIR)
+# Userspace build flags - PIE so the kernel loader can map each instance
+# at its own base and apply the RELATIVE relocations
+USR_CFLAGS := -nostdlib -ffreestanding -fPIE -fno-stack-protector \
+              -mno-red-zone -O2 -Wall -Wextra -I$(USR_DIR)
 
-USR_LDFLAGS := -static -nostdlib -no-pie -T $(USR_DIR)/linker.ld
+USR_LDFLAGS := -nostdlib -pie -T $(USR_DIR)/linker.ld
 
 C_SOURCES  := main.c \
-              $(shell find init driver mem fs scheduler exec libc $(ARCH) -name "*.c" 2>/dev/null)
+              $(shell find init driver mem fs process scheduler exec libc $(ARCH) -name "*.c" 2>/dev/null)
 
 ASM_SOURCES:= $(shell find $(ARCH) -name "*.S" 2>/dev/null)
 

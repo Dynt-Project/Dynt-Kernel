@@ -11,6 +11,8 @@
 
 #include <stdint.h>
 
+#include "../inter/isr.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -20,6 +22,10 @@ extern "C" {
 /* iretq into an explicit ring3 frame (used by exec/exit to resume a
    previously saved user context).  Never returns. */
 [[noreturn]] void usermode_resume(uint64_t rip, uint64_t rsp, uint64_t rflags);
+
+/* restores a full saved process context (GP registers + iretq frame)
+   and enters ring3.  Used by the scheduler on process switch. */
+[[noreturn]] void usermode_resume_full(const registers_t *ctx);
 
 #ifdef __cplusplus
 }

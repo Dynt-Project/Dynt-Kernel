@@ -87,5 +87,16 @@ char hid_key_to_ascii(uint16_t keycode,
 
 bool keyboard_poll_event(keyboard_event_t *event);
 
+// canonical line input: ps2_keyboard feeds keys in, userspace reads
+// complete lines out. non-blocking on purpose so the scheduler can
+// preempt a spinning userspace between calls.
+#define TTY_LINE_MAX 256
+
+// called by keyboard drivers for every pressed key
+void tty_input_char(char c);
+
+// returns a full line (newline stripped, NUL terminated) or 0 if none
+// is ready yet
+int tty_getline(char *buf, int size);
 
 #endif //DYNT_KERNEL_KEYBOARD_STACK_H

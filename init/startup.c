@@ -15,15 +15,20 @@
 #include "../arch/x86_64/inter/pic.h"
 #include "../arch/x86_64/cpu/percpu.h"
 #include "../arch/x86_64/syscall/syscall.h"
+#include "../arch/x86_64/syscall/usermode.h"
 #include "../arch/x86_64/cpu/cpu.h"
+#include "../arch/x86_64/cpu/control_regs.h"
 #include "../arch/x86_64/boot/common/bootinf.h"
 #include "../mem/mm/kheap.h"
+#include "../mem/mm/pmm.h"
+#include "../mem/mm/paging.h"
 #include "../driver/stacks/video/video_stack.h"
 #include "../driver/stacks/storage/block.h"
 #include "../driver/stacks/storage/partition.h"
 #include "../driver/buildin/video/vga/vga.h"
 #include "../driver/buildin/input/ps2/ps2_keyboard.h"
 #include "../driver/buildin/input/ps2/ps2_mouse.h"
+#include "../driver/buildin/timer/pit.h"
 #include "../driver/buildin/storage/ide/ide.h"
 #include "../driver/buildin/storage/ahci/ahci.h"
 #include "../fs/vfs.h"
@@ -31,7 +36,7 @@
 #include "../fs/ext2.h"
 #include "../scheduler/scheduler.h"
 #include "../arch/x86_64/smp/smp.h"
-#include "../exec/elf.h"
+#include "../process/process.h"
 #include "debug.h"
 #include "startup.h"
 
@@ -42,46 +47,31 @@ alignas(16) static uint8_t syscall_stack[16384];
 
 static void launch_userspace(void)
 {
-    /* Try to load /INIT from the FAT32 partition */
-    uint8_t *elf_buf = (uint8_t *)kheap_alloc(1024 * 1024, 16);
-    if (!elf_buf)
+    // create + load the init process from the FAT32 partition
+    process_t *init = process_create("init");
+
+    if (!init)
     {
-        debug_printf("[boot] no memory for userspace init\n");
+        debug_printf("[boot] no pcb for init\n");
         return;
     }
 
-    int32_t elf_size = vfs_read_file("/init", elf_buf, 1024 * 1024);
-    if (elf_size <= 0)
+    if (!process_load_elf(init, "/init"))
     {
-        debug_printf("[boot] no /init on disk (ret=%d), staying in kernel\n",
-                     (int)elf_size);
+        debug_printf("[boot] no /init on disk, staying in kernel\n");
+        process_destroy(init);
         return;
     }
 
-    debug_printf("[boot] loading userspace init: %d bytes\n",
-                 (int)elf_size);
+    scheduler_enqueue(init);
+    debug_printf("[boot] entering ring3 userspace (pid=%lu)\n", init->pid);
 
-    elf_image_t img;
-    if (!elf64_load_image(elf_buf, (size_t)elf_size, &img))
-    {
-        debug_printf("[boot] init ELF load failed\n");
-        return;
-    }
+    init->ticks = 0;
+    init->state = PROC_RUNNING;
+    process_set_current(init);
 
-    debug_printf("[boot] init entry=0x%p low=0x%p high=0x%p\n",
-                 img.entry, img.low_address, img.high_address);
-
-    /* Allocate a user stack */
-    uint64_t user_stack = (uint64_t)kheap_alloc(65536, 16);
-    if (!user_stack)
-    {
-        debug_printf("[boot] no memory for user stack\n");
-        return;
-    }
-    user_stack += 65536 - 16;
-
-    debug_printf("[boot] entering ring3 userspace\n");
-    elf64_enter_ring3(&img, user_stack);
+    write_cr3(init->cr3);
+    usermode_resume_full(&init->ctx);
 }
 
 void startup() {
@@ -119,8 +109,12 @@ void startup() {
     debug_printf("[boot] ps/2 keyboard: %s\n", ps2_kbd ? "ok" : "fail");
     debug_printf("[boot] ps/2 mouse: %s\n", ps2_mse ? "ok" : "fail");
 
+    pmm_init();
+    paging_init();
     kheap_init();
-    debug_printf("[boot] early heap ok\n");
+    debug_printf("[boot] early heap ok (%u MiB usable, %u MiB free)\n",
+                 (unsigned)(pmm_total_memory() >> 20),
+                 (unsigned)((pmm_free_frames() * 4) >> 10));
 
     scheduler_init();
     debug_printf("[boot] bore scheduler ok\n");
@@ -148,6 +142,10 @@ void startup() {
     percpu_init((uint64_t)syscall_stack_top);
     syscall_init();
     debug_printf("[boot] syscalls ok\n");
+
+    // 100 Hz PIT timer -> preemptive scheduling
+    pit_init(100);
+    debug_printf("[boot] pit timer ok\n");
 
     sti();
     debug_printf("[boot] interrupts enabled, kernel ready\n");

@@ -1,37 +1,35 @@
 // Written by [@saphhic](https://github.com/saphhic)
 // Date: 26 July 2026
 
-//   Userspace-facing syscall table.  Syscall 0-1 (exit/write) prove the
-//   SYSCALL/SYSRET path, 2-6 give the ring3 BusyBox a working stdin,
-//   filesystem and exec.  Debug messages still go to COM1 serial.
+//   Userspace-facing syscall table.  SYS_WRITE/READ drive the terminal,
+//   SYS_READ_FILE/LIST_DIR reach the VFS, SYS_EXEC spawns a new process
+//   and SYS_EXIT terminates the caller.  Everything is non-blocking so
+//   the scheduler can preempt user processes freely.
 
 #include "syscall.h"
-#include "usermode.h"
 
 #include "../io/serial.h"
 #include "../cpu/cpu.h"
-#include "../cpu/percpu.h"
 
-#include "../../../driver/stacks/input/keyboard_stack.h"
-#include "../../../driver/stacks/video/video_stack.h"
-#include "../../../fs/vfs.h"
-#include "../../../exec/elf.h"
-#include "../../../mem/mm/kheap.h"
-#include "../../../init/debug.h"
+#include "driver/stacks/input/keyboard_stack.h"
+#include "driver/stacks/video/video_stack.h"
+#include "fs/vfs.h"
+#include "exec/elf.h"
+#include "mem/mm/kheap.h"
+#include "mem/mm/paging.h"
+#include "process/process.h"
+#include "scheduler/scheduler.h"
+#include "init/debug.h"
 
-// user memory lives at 0x2000000 and up (userspace/linker.ld)
-#define USER_MIN 0x2000000ULL
-
-// saved parent context, filled by SYS_EXEC so SYS_EXIT can resume it
-static bool exec_saved;
-static uint64_t exec_rip;
-static uint64_t exec_rsp;
-static uint64_t exec_rflags;
+// user memory lives at PAGING_USER_BASE and up
+#define USER_MIN PAGING_USER_BASE
+#define USER_MAX (PAGING_USER_BASE + 0x1000000000ULL)
 
 static bool user_ptr_ok(const void *ptr, uint64_t len)
 {
     uint64_t p = (uint64_t)ptr;
-    return p >= USER_MIN && p <= USER_MIN + 0x4000000ULL && len <= 0x4000000ULL;
+    return p >= USER_MIN && p < USER_MAX && len <= 0x1000000000ULL &&
+           p + len < USER_MAX;
 }
 
 // writes to serial always, VGA understands the ANSI sequences BusyBox
@@ -78,57 +76,6 @@ static void term_write(const char *buf, uint64_t len)
                     state = T_NORM;
                 }
                 break;
-        }
-    }
-}
-
-// blocking line read with echo; returns length (newline stripped) or -1
-static int32_t sys_read_line(char *buf, uint64_t len)
-{
-    if (!user_ptr_ok(buf, len) || len == 0)
-        return -1;
-
-    int32_t n = 0;
-
-    for (;;)
-    {
-        keyboard_event_t ev;
-
-        // wait for the next event with interrupts on; IRQ frames go to
-        // the TSS rsp0 stack, our syscall frame lives on the dedicated
-        // syscall stack, so nothing collides
-        sti();
-        while (!keyboard_poll_event(&ev))
-        {
-            hlt();
-        }
-        cli();
-
-        if (!ev.pressed)
-            continue;
-
-        if (ev.keycode == KEY_ENTER)
-        {
-            if (n > 0)
-                debug_putc('\n');
-            buf[n] = 0;
-            return n;
-        }
-
-        if (ev.keycode == KEY_BACKSPACE)
-        {
-            if (n > 0)
-            {
-                n--;
-                debug_puts("\b \b");
-            }
-            continue;
-        }
-
-        if (ev.ascii && n < (int32_t)len - 1)
-        {
-            buf[n++] = ev.ascii;
-            debug_putc(ev.ascii);
         }
     }
 }
@@ -196,62 +143,81 @@ static int32_t sys_read_file(const char *path, void *buf, uint64_t len)
     return vfs_read_file(path, buf, (uint32_t)len);
 }
 
-// jumps into a freshly loaded ELF, never returns
-static void sys_exec(const char *path)
+static void sys_sleep(uint64_t ms)
 {
-    if (!user_ptr_ok(path, 1))
-        return;
+    // spin with hlt; a timer irq wakes the cpu each tick, and the timer
+    // handler refuses to preempt kernel mode, so this is a clean wait
+    uint64_t now = 0;
+    uint64_t target = ms / 10;  // ticks at 100 Hz
 
-    uint8_t *elf_buf = (uint8_t *)kheap_alloc(1024 * 1024, 16);
-    if (!elf_buf)
-        return;
-
-    int32_t size = vfs_read_file(path, elf_buf, 1024 * 1024);
-    if (size <= 0)
-    {
-        kheap_free(elf_buf);
-        return;
-    }
-
-    elf_image_t img;
-    if (!elf64_load_image(elf_buf, (size_t)size, &img))
-    {
-        kheap_free(elf_buf);
-        return;
-    }
-
-    uint64_t user_stack = (uint64_t)kheap_alloc(65536, 16);
-    if (!user_stack)
-    {
-        kheap_free(elf_buf);
-        return;
-    }
-    user_stack += 65536 - 16;
-
-    kheap_free(elf_buf);
-
-    debug_printf("[syscall] exec %s: entry=0x%p\n", path, img.entry);
-
-    usermode_resume(img.entry, user_stack, 0x202);
-}
-
-static void sys_exit(void)
-{
-    if (exec_saved)
-    {
-        exec_saved = false;
-        debug_printf("[syscall] resuming parent\n");
-        // the parent's SYS_EXEC must see a defined return value
-        __asm__ volatile("xor %rax, %rax");
-        usermode_resume(exec_rip, exec_rsp, exec_rflags);
-    }
-
-    serial_write("\n[syscall] SYS_EXIT, System Halting\n");
-    cli();
-    for (;;)
+    sti();
+    while (now < target)
     {
         hlt();
+        now++;
     }
+    cli();
+}
+
+typedef struct
+{
+    char *buf;
+    uint32_t size;
+    uint32_t used;
+} ps_buf_t;
+
+static void ps_append(uint64_t pid, const char *name, const char *state,
+                      void *user)
+{
+    ps_buf_t *pb = (ps_buf_t *)user;
+    char line[64];
+    int n = 0;
+
+    uint64_t p = pid;
+    do
+    {
+        line[n++] = (char)('0' + p % 10);
+        p /= 10;
+    } while (p && n < 8);
+    // reverse pid digits
+    for (int i = 0, j = n - 1; i < j; i++, j--)
+    {
+        char t = line[i];
+        line[i] = line[j];
+        line[j] = t;
+    }
+
+    line[n++] = ' ';
+
+    for (const char *s = name; *s && n < 40; s++)
+        line[n++] = *s;
+
+    while (n < 40)
+        line[n++] = ' ';
+
+    for (const char *s = state; *s && n < 56; s++)
+        line[n++] = *s;
+
+    line[n++] = '\n';
+
+    for (int i = 0; i < n && pb->used < pb->size - 1; i++)
+        pb->buf[pb->used++] = line[i];
+}
+
+static int32_t sys_ps(char *buf, uint64_t len)
+{
+    if (!user_ptr_ok(buf, len))
+        return -1;
+
+    ps_buf_t pb;
+    pb.buf = buf;
+    pb.size = (uint32_t)(len > 0 ? len - 1 : 0);
+    pb.used = 0;
+
+    scheduler_list(ps_append, &pb);
+
+    buf[pb.used] = 0;
+    return (int32_t)pb.used;
 }
 
 void syscall_dispatch(syscall_regs_t *regs) {
@@ -263,7 +229,12 @@ void syscall_dispatch(syscall_regs_t *regs) {
             break;
 
         case SYS_READ:
-            regs->rax = sys_read_line((char *)regs->rdi, regs->rsi);
+            if (!user_ptr_ok((void *)regs->rdi, regs->rsi))
+            {
+                regs->rax = -1;
+                break;
+            }
+            regs->rax = tty_getline((char *)regs->rdi, (int)regs->rsi);
             break;
 
         case SYS_READ_FILE:
@@ -277,26 +248,47 @@ void syscall_dispatch(syscall_regs_t *regs) {
             break;
 
         case SYS_EXEC: {
-            // save the calling context so SYS_EXIT can come back
-            exec_saved = true;
-            exec_rip = regs->rcx;
-            exec_rsp = g_percpu0.user_rsp;
-            exec_rflags = regs->r11;
+            const char *path = (const char *)regs->rdi;
 
-            sys_exec((const char *)regs->rdi);
+            if (!user_ptr_ok(path, 1))
+            {
+                regs->rax = (uint64_t)-1;
+                break;
+            }
 
-            // sys_exec failed, restore the saved context for the parent
-            exec_saved = false;
-            regs->rax = (uint64_t)-1;
+            process_t *child = process_create("user");
+            if (!child || !process_load_elf(child, path))
+            {
+                if (child)
+                    process_destroy(child);
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+
+            scheduler_enqueue(child);
+            debug_printf("[syscall] spawned pid %lu running %s\n",
+                         child->pid, path);
+            regs->rax = child->pid;
             break;
         }
 
-        case SYS_GETPID:
-            regs->rax = 1;
+        case SYS_GETPID: {
+            process_t *cur = process_current();
+            regs->rax = cur ? cur->pid : 1;
+            break;
+        }
+
+        case SYS_SLEEP:
+            sys_sleep(regs->rdi);
+            regs->rax = 0;
+            break;
+
+        case SYS_PS:
+            regs->rax = sys_ps((char *)regs->rdi, regs->rsi);
             break;
 
         case SYS_EXIT:
-            sys_exit();
+            scheduler_exit_current();
             break;
 
         default:
