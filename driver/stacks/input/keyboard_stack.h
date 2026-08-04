@@ -99,4 +99,10 @@ void tty_input_char(char c);
 // is ready yet
 int tty_getline(char *buf, int size);
 
+// true if a full line is waiting to be consumed
+bool tty_line_ready(void);
+
+// drains polled COM1 input into the canonical line buffer
+void tty_drain_serial(void);
+
 #endif //DYNT_KERNEL_KEYBOARD_STACK_H

@@ -32,6 +32,8 @@ CXXFLAGS   := -std=c++20 \
               -O2 \
               -Wall \
               -Wextra \
+              -MMD \
+              -MP \
               -I. \
               -I$(ARCH)
 
@@ -74,6 +76,8 @@ $(BUILD_DIR)/%.o: %.c
 $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(ASFLAGS) -c $< -o $@
+
+-include $(C_OBJECTS:.o=.d)
 
 # =================== userspace build (delegates to userspace/Makefile) ===================
 

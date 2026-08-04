@@ -6,6 +6,7 @@
 #include "keyboard_stack.h"
 
 #include "../../init/debug.h"
+#include "../../arch/x86_64/io/serial.h"
 
 static bool key_state[KEYBOARD_MAX_KEYS];
 
@@ -181,6 +182,20 @@ int tty_getline(char *buf, int size)
     tty_len = 0;
     tty_ready = false;
     return n;
+}
+
+// true if a full line is waiting to be consumed
+bool tty_line_ready(void)
+{
+    return tty_ready;
+}
+
+// drains polled COM1 input into the canonical line buffer so a
+// headless serial console works as stdin without a display/PS2
+void tty_drain_serial(void)
+{
+    while (serial_received())
+        tty_input_char(serial_read_char());
 }
 
 // translates a scancode set 1 keycode into an ascii char

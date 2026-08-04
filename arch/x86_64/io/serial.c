@@ -35,3 +35,11 @@ void serial_write(const char *str) {
         str++;
     }
 }
+
+bool serial_received(void) {
+    return (inb(COM1 + 5) & 0x01) != 0;
+}
+
+char serial_read_char(void) {
+    return (char)inb(COM1);
+}

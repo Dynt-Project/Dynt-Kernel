@@ -46,7 +46,9 @@ bool fat32_write_file(fat32_ctx_t *ctx, const char *path,
                       const void *buffer, uint32_t size);
 uint32_t fat32_write(fat32_ctx_t *ctx, uint32_t *first_cluster,
                      uint32_t offset, const void *buffer, uint32_t size);
-bool fat32_update_size(fat32_ctx_t *ctx, const char *path, uint32_t size);
+// updates size + first cluster of an existing file's directory entry
+bool fat32_update_size(fat32_ctx_t *ctx, const char *path,
+                       uint32_t first_cluster, uint32_t size);
 bool fat32_stat(fat32_ctx_t *ctx, const char *path,
                 uint64_t *size, bool *is_dir);
 void fat32_list(fat32_ctx_t *ctx,

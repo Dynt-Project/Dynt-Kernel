@@ -33,6 +33,12 @@ typedef bool (*vfs_write_file_fn)(void *ctx, const char *path,
                                   const void *buffer, uint32_t size);
 typedef bool (*vfs_stat_file_fn)(void *ctx, const char *path,
                                  uint64_t *size, bool *is_dir);
+typedef int32_t (*vfs_read_at_fn)(void *ctx, const char *path,
+                                  uint32_t offset, void *buffer,
+                                  uint32_t buffer_size);
+typedef bool (*vfs_write_at_fn)(void *ctx, const char *path,
+                                uint32_t offset, const void *buffer,
+                                uint32_t size, uint32_t *out_new_size);
 typedef void (*vfs_list_dir_fn)(void *ctx, const char *path,
                                 void (*callback)(const char *name,
                                                  uint32_t size,
@@ -48,6 +54,8 @@ typedef struct vfs_fs_type
     vfs_read_file_fn read_file;
     vfs_write_file_fn write_file;
     vfs_stat_file_fn stat_file;
+    vfs_read_at_fn read_at;
+    vfs_write_at_fn write_at;
     vfs_list_dir_fn list_dir;
     struct vfs_fs_type *next;
 } vfs_fs_type_t;
@@ -80,6 +88,17 @@ void vfs_list_dir(const char *path,
                                    bool is_dir,
                                    void *user),
                   void *user);
+
+// fd-based file I/O (Linux open/read/write/lseek/close ABI, negative =
+// error). the per-process fd table lives in process_t.
+int32_t vfs_open_fd(process_t *proc, const char *path, uint32_t flags);
+int64_t vfs_read_fd(process_t *proc, int32_t fd, void *buf, uint64_t len);
+int64_t vfs_write_fd(process_t *proc, int32_t fd, const void *buf,
+                     uint64_t len);
+int64_t vfs_seek_fd(process_t *proc, int32_t fd, int64_t off,
+                    uint32_t whence);
+int32_t vfs_close_fd(process_t *proc, int32_t fd);
+int32_t vfs_stat(const char *path, uint64_t *size, bool *is_dir);
 
 #ifdef __cplusplus
 }

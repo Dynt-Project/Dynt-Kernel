@@ -292,21 +292,83 @@ void syscall_dispatch(syscall_regs_t *regs) {
 
         case SYS_WRITE:
             // Linux ABI: write(fd, buf, count) -> rdi=fd, rsi=buf, rdx=count
-            if (regs->rdi > 2 || !user_ptr_ok((void *)regs->rsi, regs->rdx))
+            if (!user_ptr_ok((void *)regs->rsi, regs->rdx))
             {
                 regs->rax = (uint64_t)-1;
                 break;
             }
-            regs->rax = term_write((const char *)regs->rsi, regs->rdx);
+            if (regs->rdi <= 2)
+                regs->rax = term_write((const char *)regs->rsi, regs->rdx);
+            else
+                regs->rax = (uint64_t)vfs_write_fd(process_current(),
+                                                   (int32_t)regs->rdi,
+                                                   (const void *)regs->rsi,
+                                                   regs->rdx);
             break;
 
-        case SYS_READ:
-            if (!user_ptr_ok((void *)regs->rdi, regs->rsi))
+        case SYS_READ: {
+            // Linux ABI: read(fd, buf, count) -> rdi=fd, rsi=buf, rdx=count
+            int64_t fd = (int64_t)regs->rdi;
+            void *buf = (void *)regs->rsi;
+            uint64_t len = regs->rdx;
+
+            if (len == 0)
             {
-                regs->rax = -1;
+                regs->rax = 0;
                 break;
             }
-            regs->rax = tty_getline((char *)regs->rdi, (int)regs->rsi);
+            if (!user_ptr_ok(buf, len))
+            {
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+
+            if (fd == 0)
+            {
+                // canonical tty read, blocking so a shell/fgets can wait
+                // for a line; keyboard IRQs and serial bytes both wake hlt
+                sti();
+                do
+                {
+                    tty_drain_serial();
+                    if (tty_line_ready())
+                        break;
+                    hlt();
+                } while (true);
+                cli();
+                regs->rax = (uint64_t)tty_getline((char *)buf, (int)len);
+            }
+            else if (fd >= 3)
+                regs->rax = (uint64_t)vfs_read_fd(process_current(),
+                                                  (int32_t)fd, buf, len);
+            else
+                regs->rax = (uint64_t)-1;  // EBADF
+            break;
+        }
+
+        case SYS_OPEN: {
+            const char *path = (const char *)regs->rdi;
+            uint32_t flags = (uint32_t)regs->rsi;
+
+            if (!user_ptr_ok(path, 1))
+            {
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+            regs->rax = (uint64_t)vfs_open_fd(process_current(), path, flags);
+            break;
+        }
+
+        case SYS_CLOSE:
+            regs->rax = (uint64_t)vfs_close_fd(process_current(),
+                                               (int32_t)regs->rdi);
+            break;
+
+        case SYS_SEEK:
+            regs->rax = (uint64_t)vfs_seek_fd(process_current(),
+                                              (int32_t)regs->rdi,
+                                              (int64_t)regs->rsi,
+                                              (uint32_t)regs->rdx);
             break;
 
         case SYS_READ_FILE:

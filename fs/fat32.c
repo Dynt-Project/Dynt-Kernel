@@ -3,6 +3,7 @@
 #include "vfs.h"
 #include "../mem/lib/memory.h"
 #include "../mem/mm/kheap.h"
+#include "../init/debug.h"
 
 #define FAT32_EOC 0x0FFFFFF8
 #define FAT32_BAD 0x0FFFFFF7
@@ -966,7 +967,7 @@ bool fat32_update_size(fat32_ctx_t *ctx, const char *path,
         return false;
 
     return write_dir_entry_at(ctx, loc.cluster, loc.offset,
-                              components[depth - 1], loc.d.first_cluster, size);
+                              components[depth - 1], first_cluster, size);
 }
 
 bool fat32_stat(fat32_ctx_t *ctx, const char *path, uint64_t *size, bool *is_dir)
@@ -1059,6 +1060,71 @@ static void fat32_list_dir_ctx(fat32_ctx_t *ctx, const char *path,
     read_directory(ctx, dir_cluster, list_visit, &s);
 }
 
+static int32_t fat32_vfs_read_at(void *vctx, const char *path,
+                                 uint32_t offset, void *buffer,
+                                 uint32_t buffer_size)
+{
+    fat32_ctx_t *ctx = (fat32_ctx_t *)vctx;
+
+    if (!ctx || !buffer || !path)
+        return -1;
+
+    fat32_dirent_t entry;
+
+    if (!fat32_open(ctx, path, &entry) || entry.is_dir)
+        return -1;
+
+    if (offset >= entry.size)
+        return 0;
+
+    if (buffer_size > entry.size - offset)
+        buffer_size = entry.size - offset;
+
+    return (int32_t)fat32_read_at(ctx, entry.first_cluster, offset, buffer,
+                                  buffer_size);
+}
+
+static bool fat32_vfs_write_at(void *vctx, const char *path,
+                               uint32_t offset, const void *buffer,
+                               uint32_t size, uint32_t *out_new_size)
+{
+    fat32_ctx_t *ctx = (fat32_ctx_t *)vctx;
+
+    if (!ctx || !path || (size > 0 && !buffer))
+        return false;
+
+    fat32_dirent_t entry;
+
+    if (!fat32_open(ctx, path, &entry) || entry.is_dir)
+        return false;
+
+    uint32_t first_cluster = entry.first_cluster;
+
+    uint32_t done = fat32_write(ctx, &first_cluster, offset, buffer, size);
+
+    if (done != size)
+        return false;
+
+    uint32_t new_size = entry.size;
+
+    if (offset + size > new_size)
+        new_size = offset + size;
+
+    if (!fat32_update_size(ctx, path, first_cluster, new_size))
+        return false;
+
+    if (out_new_size)
+        *out_new_size = new_size;
+
+    return true;
+}
+
+static bool fat32_vfs_stat_file(void *vctx, const char *path, uint64_t *size,
+                                bool *is_dir)
+{
+    return fat32_stat((fat32_ctx_t *)vctx, path, size, is_dir);
+}
+
 static int32_t fat32_vfs_read_file(void *vctx, const char *path,
                                    void *buffer, uint32_t buffer_size)
 {
@@ -1108,6 +1174,9 @@ void fat32_register(void)
     fs.mount = fat32_vfs_mount;
     fs.read_file = fat32_vfs_read_file;
     fs.write_file = fat32_vfs_write_file;
+    fs.stat_file = fat32_vfs_stat_file;
+    fs.read_at = fat32_vfs_read_at;
+    fs.write_at = fat32_vfs_write_at;
     fs.list_dir = fat32_vfs_list_dir;
     vfs_register_fs(&fs);
 }

@@ -21,6 +21,11 @@ void serial_init(void);
 void serial_write_char(char c);
 void serial_write(const char *str);
 
+// polled COM1 RX (no IRQ yet) - used to give userspace a headless
+// tty over the emulated serial port
+bool serial_received(void);
+char serial_read_char(void);
+
 #ifdef __cplusplus
 }
 #endif
