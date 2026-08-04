@@ -288,10 +288,6 @@ static int64_t sys_munmap(uint64_t addr, uint64_t len)
 }
 
 void syscall_dispatch(syscall_regs_t *regs) {
-    static uint64_t sc_count;
-    if (sc_count++ < 40)
-        debug_printf("[sc] #%lu no=%lu rdi=0x%lx rsi=0x%lx rdx=0x%lx\n",
-                     sc_count, regs->rax, regs->rdi, regs->rsi, regs->rdx);
     switch (regs->rax) {
 
         case SYS_WRITE:
