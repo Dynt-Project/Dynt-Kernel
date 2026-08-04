@@ -8,6 +8,21 @@
 
 #define VFS_NAME_MAX 32
 
+// open() flags, Linux-compatible values (see abi-bits/fcntl.h)
+#define VFS_O_RDONLY 0
+#define VFS_O_WRONLY 1
+#define VFS_O_RDWR   2
+#define VFS_O_CREAT  0100
+#define VFS_O_TRUNC  01000
+#define VFS_O_APPEND 02000
+
+// lseek() whence values
+#define VFS_SEEK_SET 0
+#define VFS_SEEK_CUR 1
+#define VFS_SEEK_END 2
+
+typedef struct process process_t;
+
 typedef struct vfs_mount vfs_mount_t;
 
 typedef bool (*vfs_probe_fn)(block_device_t *dev);
@@ -16,6 +31,8 @@ typedef int32_t (*vfs_read_file_fn)(void *ctx, const char *path,
                                     void *buffer, uint32_t buffer_size);
 typedef bool (*vfs_write_file_fn)(void *ctx, const char *path,
                                   const void *buffer, uint32_t size);
+typedef bool (*vfs_stat_file_fn)(void *ctx, const char *path,
+                                 uint64_t *size, bool *is_dir);
 typedef void (*vfs_list_dir_fn)(void *ctx, const char *path,
                                 void (*callback)(const char *name,
                                                  uint32_t size,
@@ -30,6 +47,7 @@ typedef struct vfs_fs_type
     vfs_mount_fn mount;
     vfs_read_file_fn read_file;
     vfs_write_file_fn write_file;
+    vfs_stat_file_fn stat_file;
     vfs_list_dir_fn list_dir;
     struct vfs_fs_type *next;
 } vfs_fs_type_t;

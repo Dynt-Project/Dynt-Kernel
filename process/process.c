@@ -61,6 +61,14 @@ process_t *process_create(const char *name)
     proc->ctx.rflags = 0x202;
     proc->mmap_cursor = PROCESS_MMAP_START;
 
+    // fds 0-2 are the tty (stdin/stdout/stderr), like Linux
+    for (int i = 0; i < 3 && i < PROCESS_MAX_FDS; i++)
+    {
+        k_strncpy(proc->files[i].path, "tty", sizeof(proc->files[i].path));
+        proc->files[i].offset = 0;
+        proc->files[i].open = true;
+    }
+
     if (name)
         k_strncpy(proc->name, name, sizeof(proc->name));
     else

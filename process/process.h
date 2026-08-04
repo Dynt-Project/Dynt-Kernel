@@ -16,6 +16,18 @@
 // well below the user stack and above the PIE base range
 #define PROCESS_MMAP_START 0x1000000000ULL
 
+// open file table: Linux-style file descriptors. fds 0-2 are the tty,
+// regular files start at fd 3.
+#define PROCESS_MAX_FDS 16
+#define PROCESS_PATH_MAX 128
+
+typedef struct proc_file
+{
+    char path[PROCESS_PATH_MAX];
+    uint64_t offset;
+    bool open;
+} proc_file_t;
+
 typedef enum process_state
 {
     PROC_READY,
@@ -32,6 +44,7 @@ typedef struct process
     uint64_t ticks;        // ticks consumed on the current slice
     uint64_t fs_base;      // FS segment base (mlibc TCB), restored on switch
     uint64_t mmap_cursor;  // bump cursor for anonymous user mappings
+    proc_file_t files[PROCESS_MAX_FDS];
     // full saved user context: general registers + the iretq frame
     // (rip/cs/rflags/user_rsp/ss). the scheduler copies the interrupt
     // frame here on preempt and back into the frame on switch-in

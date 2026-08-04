@@ -148,6 +148,77 @@ uint32_t fat32_read(fat32_ctx_t *ctx, uint32_t start_cluster,
     return total;
 }
 
+uint32_t fat32_read_at(fat32_ctx_t *ctx, uint32_t start_cluster,
+                       uint32_t offset, void *buffer, uint32_t buffer_size)
+{
+    if (!ctx || !buffer || buffer_size == 0)
+        return 0;
+
+    uint32_t bpc = ctx->bytes_per_cluster;
+    uint32_t cluster = start_cluster;
+    uint32_t cl_idx = 0;
+    uint32_t start_cl_idx = offset / bpc;
+    uint32_t in_cluster = offset % bpc;
+
+    while (cl_idx < start_cl_idx && cluster_valid(cluster))
+    {
+        cluster = fat_read_entry(ctx, cluster);
+        cl_idx++;
+    }
+
+    if (!cluster_valid(cluster))
+        return 0;
+
+    uint8_t *dst = (uint8_t *)buffer;
+    uint8_t *tmp = (uint8_t *)kheap_alloc(bpc, 16);
+
+    if (!tmp)
+        return 0;
+
+    uint32_t total = 0;
+
+    while (total < buffer_size)
+    {
+        uint32_t left = bpc - in_cluster;
+        uint32_t chunk = buffer_size - total;
+
+        if (chunk > left)
+            chunk = left;
+
+        uint32_t sectors = chunk / ctx->bytes_per_sector;
+
+        if (in_cluster == 0 && chunk == bpc)
+        {
+            if (!block_read(ctx->dev, cluster_to_lba(ctx, cluster),
+                            ctx->sectors_per_cluster, dst + total))
+                break;
+        }
+        else
+        {
+            if (!block_read(ctx->dev, cluster_to_lba(ctx, cluster),
+                            ctx->sectors_per_cluster, tmp))
+                break;
+
+            k_memcpy(dst + total, tmp + in_cluster, chunk);
+        }
+
+        total += chunk;
+        in_cluster += chunk;
+
+        if (in_cluster == bpc)
+        {
+            in_cluster = 0;
+            cluster = fat_read_entry(ctx, cluster);
+
+            if (!cluster_valid(cluster))
+                break;
+        }
+    }
+
+    kheap_free(tmp);
+    return total;
+}
+
 static void build_short_name(const uint8_t *entry, char *out, uint32_t out_size)
 {
     uint32_t pos = 0;
@@ -758,6 +829,160 @@ bool fat32_write_file(fat32_ctx_t *ctx, const char *path,
 
     return write_dir_entry_at(ctx, slot_cluster, slot_offset,
                               components[depth - 1], first_cluster, size);
+}
+
+// offset-based write into an existing file; extends the cluster chain as
+// needed. *first_cluster is in/out: a zero-size file has no cluster, so the
+// first allocated cluster is returned through it.
+uint32_t fat32_write(fat32_ctx_t *ctx, uint32_t *first_cluster, uint32_t offset,
+                     const void *buffer, uint32_t size)
+{
+    if (!ctx || !first_cluster || !buffer || size == 0)
+        return 0;
+
+    uint32_t bpc = ctx->bytes_per_cluster;
+    const uint8_t *src = (const uint8_t *)buffer;
+    uint8_t *cbuf = (uint8_t *)kheap_alloc(bpc, 16);
+
+    if (!cbuf)
+        return 0;
+
+    uint32_t in_cluster = offset % bpc;
+    uint32_t cluster = *first_cluster;
+    uint32_t prev = *first_cluster;
+    uint32_t cl_idx = 0;
+    uint32_t start_cl_idx = offset / bpc;
+
+    while (cl_idx < start_cl_idx && cluster_valid(cluster))
+    {
+        prev = cluster;
+        cluster = fat_read_entry(ctx, cluster);
+        cl_idx++;
+    }
+
+    uint32_t done = 0;
+
+    while (done < size)
+    {
+        if (!cluster_valid(cluster))
+        {
+            uint32_t newcl = fat32_alloc_cluster(ctx);
+
+            if (!newcl)
+                break;
+
+            if (!*first_cluster)
+            {
+                *first_cluster = newcl;
+            }
+            else if (!fat_write_entry(ctx, prev, newcl))
+            {
+                fat32_free_chain(ctx, newcl);
+                break;
+            }
+
+            cluster = newcl;
+        }
+
+        uint32_t left = bpc - in_cluster;
+        uint32_t chunk = size - done;
+
+        if (chunk > left)
+            chunk = left;
+
+        if (in_cluster == 0 && chunk == bpc)
+        {
+            if (!block_write(ctx->dev, cluster_to_lba(ctx, cluster),
+                             ctx->sectors_per_cluster, src + done))
+                break;
+        }
+        else
+        {
+            if (!block_read(ctx->dev, cluster_to_lba(ctx, cluster),
+                            ctx->sectors_per_cluster, cbuf))
+                break;
+
+            k_memcpy(cbuf + in_cluster, src + done, chunk);
+
+            if (!block_write(ctx->dev, cluster_to_lba(ctx, cluster),
+                             ctx->sectors_per_cluster, cbuf))
+                break;
+        }
+
+        done += chunk;
+        in_cluster += chunk;
+
+        if (in_cluster == bpc)
+        {
+            in_cluster = 0;
+            prev = cluster;
+            cluster = fat_read_entry(ctx, cluster);
+        }
+    }
+
+    kheap_free(cbuf);
+    return done;
+}
+
+// updates size + first cluster of an existing file's directory entry
+bool fat32_update_size(fat32_ctx_t *ctx, const char *path,
+                       uint32_t first_cluster, uint32_t size)
+{
+    if (!ctx || !path)
+        return false;
+
+    char components[8][FAT32_NAME_MAX];
+    uint32_t depth = 0;
+    const char *p = path;
+    char comp[FAT32_NAME_MAX];
+
+    while (split_component(&p, comp, sizeof(comp)))
+    {
+        if (depth >= 8)
+            return false;
+
+        k_strncpy(components[depth], comp, sizeof(components[depth]));
+        depth++;
+    }
+
+    if (depth == 0)
+        return false;
+
+    uint32_t dir_cluster = ctx->root_cluster;
+
+    for (uint32_t i = 0; i + 1 < depth; i++)
+    {
+        fat32_dirent_t e;
+
+        if (!find_entry(ctx, dir_cluster, components[i], &e) || !e.is_dir)
+            return false;
+
+        dir_cluster = e.first_cluster;
+    }
+
+    fat32_entry_loc_t loc;
+
+    if (!locate_entry(ctx, dir_cluster, components[depth - 1], &loc))
+        return false;
+
+    return write_dir_entry_at(ctx, loc.cluster, loc.offset,
+                              components[depth - 1], loc.d.first_cluster, size);
+}
+
+bool fat32_stat(fat32_ctx_t *ctx, const char *path, uint64_t *size, bool *is_dir)
+{
+    fat32_dirent_t entry;
+
+    if (!ctx || !path || !fat32_open(ctx, path, &entry))
+        return false;
+
+    if (size)
+        *size = entry.size;
+
+    if (is_dir)
+        *is_dir = entry.is_dir;
+
+    return true;
 }
 
 bool fat32_open(fat32_ctx_t *ctx, const char *name, fat32_dirent_t *out)
