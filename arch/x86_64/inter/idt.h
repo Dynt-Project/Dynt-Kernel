@@ -43,6 +43,9 @@ void idt_init(void);
 
 void idt_set_gate(uint8_t vector, uint64_t handler, uint16_t selector, uint8_t ist, uint8_t type_attr);
 
+// the APs load the same IDT; returns the BSP's idtr so they can lgdt/lidt
+void idt_get_ptr(uint64_t *base, uint16_t *limit);
+
 
 #ifdef __cplusplus
 }

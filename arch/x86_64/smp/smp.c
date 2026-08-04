@@ -1,8 +1,18 @@
 #include "smp.h"
 
+#include "../cpu/cpu.h"
 #include "../cpu/msr.h"
+#include "../cpu/percpu.h"
 #include "../io/io.h"
+#include "../inter/gdt.h"
+#include "../inter/idt.h"
+#include "../syscall/syscall.h"
+#include "lapic.h"
+#include "../../../init/debug.h"
 #include "../../../mem/lib/memory.h"
+#include "../../../mem/mm/kheap.h"
+#include "../../../mem/mm/paging.h"
+#include "../../../scheduler/scheduler.h"
 
 #define IA32_APIC_BASE_MSR 0x1B
 #define IA32_APIC_BASE_ENABLE 0x800
@@ -394,4 +404,206 @@ const smp_cpu_t *smp_cpu_at(uint32_t index)
 uintptr_t smp_lapic_base(void)
 {
     return lapic_base;
+}
+
+/* =================== application processor boot =================== */
+
+// runtime address of the trampoline (copied below the 1 MiB kernel image;
+// the region 0x8000-0x8FFF is inside the pmm-reserved low memory).  The
+// offsets must match trampoline.S.
+#define TRAMP_BASE 0x8000
+#define TRAMP_INFO_OFF 0x200       // trampoline_info block
+#define TRAMP_INFO_CR3 0x08        //  kernel_cr3
+#define TRAMP_INFO_ENTRY 0x10      //  ap_entry_64
+#define TRAMP_CPU_TABLE_OFF 0x240  // 16 x 8-byte slots (stack, lapic id)
+#define TRAMP_MAX_SLOTS 16
+
+#define TRAMP_SIPI_VECTOR (TRAMP_BASE >> 12)
+
+// kernel symbols around the trampoline blob (trampoline.S)
+extern "C" char _trampoline_start[];
+extern "C" char _trampoline_end[];
+
+// lidt helper from tables_asm.S (the APs share the BSP's IDT)
+extern "C" void idt_flush(uint64_t idtr_addr);
+
+// per-cpu boot context, allocated by the BSP before the IPIs go out
+typedef struct ap_boot_context
+{
+    uint64_t kernel_stack_top;   // interrupt stack / TSS rsp0 / boot rsp
+    uint64_t syscall_stack_top;  // syscall kernel stack (percpu kernel_rsp)
+    gdt_entry_t *gdt;
+    tss_t *tss;
+} ap_boot_context_t;
+
+static ap_boot_context_t ap_ctx[SMP_MAX_BOOT_CPUS];
+static volatile uint32_t g_ap_online;
+static uint32_t g_lapic_timer_count;
+
+// 10 ms per PIT tick; used for the INIT -> SIPI gap
+static void ap_delay_ms(uint32_t ms)
+{
+    uint64_t start = scheduler_ticks();
+    uint64_t ticks = (ms + 9) / 10;
+
+    while (scheduler_ticks() - start < ticks)
+        pause_cpu();
+}
+
+// rough busy-wait for the ~200 us gap between the two SIPIs
+static void ap_delay_us(uint32_t us)
+{
+    uint32_t i;
+
+    for (i = 0; i < us * 20; i++)
+        pause_cpu();
+}
+
+// C entry of the application processors (trampoline jumps here with the
+// cpu index in edi and the kernel stack already loaded)
+extern "C" void smp_ap_entry(uint32_t cpu)
+{
+    if (cpu < SMP_MAX_BOOT_CPUS)
+    {
+        const smp_cpu_t *c = smp_cpu_at(cpu);
+
+        if (c && ap_ctx[cpu].gdt)
+        {
+            // GS MSRs first: everything below resolves per-cpu state
+            percpu_init_cpu(cpu, c->lapic_id, ap_ctx[cpu].kernel_stack_top,
+                            ap_ctx[cpu].syscall_stack_top);
+
+            // per-cpu GDT + TSS (TSS rsp0 = this cpu's interrupt stack)
+            gdt_load_cpu(ap_ctx[cpu].gdt);
+
+            // load the shared IDT (each cpu has its own IDTR)
+            gdt_ptr_t idtr;
+            uint64_t base;
+            uint16_t limit;
+
+            idt_get_ptr(&base, &limit);
+            idtr.limit = limit;
+            idtr.base = base;
+            idt_flush((uint64_t)&idtr);
+
+            // per-cpu syscall MSRs (STAR/LSTAR/FMASK) + clean FS base
+            syscall_init();
+            wrmsr(MSR_IA32_FS_BASE, 0);
+
+            // this cpu's own 100 Hz scheduler clock
+            lapic_timer_init(g_lapic_timer_count);
+
+            __atomic_add_fetch(&g_ap_online, 1, __ATOMIC_RELEASE);
+
+            debug_printf("[boot] cpu %u online (lapic 0x%x)\n",
+                         (unsigned)cpu, (unsigned)c->lapic_id);
+
+            sti();
+            scheduler_idle_cpu();
+        }
+    }
+
+    for (;;)
+    {
+        cli();
+        hlt();
+    }
+}
+
+void smp_start_aps(uint32_t lapic_timer_count)
+{
+    uint32_t count = smp_cpu_count();
+    uint32_t expected = 0;
+
+    for (uint32_t i = 0; i < count; i++)
+    {
+        const smp_cpu_t *c = smp_cpu_at(i);
+
+        if (c->enabled && !c->bootstrap)
+            expected++;
+    }
+
+    if (expected == 0)
+        return;
+
+    g_lapic_timer_count = lapic_timer_count;
+    g_ap_online = 0;
+
+    // copy the trampoline blob to its fixed low-memory address
+    uintptr_t blob = (uintptr_t)_trampoline_start;
+    uintptr_t blob_end = (uintptr_t)_trampoline_end;
+    size_t blob_size = blob_end > blob ? blob_end - blob : 0;
+
+    if (blob_size == 0 ||
+        blob_size > TRAMP_CPU_TABLE_OFF + TRAMP_MAX_SLOTS * 8)
+    {
+        debug_printf("[boot] smp: bad trampoline size %lu\n",
+                     (unsigned long)blob_size);
+        return;
+    }
+
+    k_memcpy((void *)TRAMP_BASE, (const void *)blob, blob_size);
+
+    // shared info block: cr3 + C entry (cpu-independent)
+    *(volatile uint64_t *)(TRAMP_BASE + TRAMP_INFO_OFF + TRAMP_INFO_CR3) =
+        paging_kernel_cr3();
+    *(volatile uint64_t *)(TRAMP_BASE + TRAMP_INFO_OFF + TRAMP_INFO_ENTRY) =
+        (uint64_t)(uintptr_t)smp_ap_entry;
+
+    // per-cpu stacks + GDT/TSS, and the slot table the APs search by lapic id
+    for (uint32_t i = 0; i < count && i < TRAMP_MAX_SLOTS; i++)
+    {
+        const smp_cpu_t *c = smp_cpu_at(i);
+
+        uintptr_t kstack = (uintptr_t)kheap_alloc(16384, 16);
+        uintptr_t sstack = (uintptr_t)kheap_alloc(16384, 16);
+        gdt_entry_t *gdt = (gdt_entry_t *)kheap_alloc(sizeof(gdt_entry_t) * 7, 16);
+        tss_t *tss = (tss_t *)kheap_alloc(sizeof(tss_t), 16);
+
+        if (!kstack || !sstack || !gdt || !tss ||
+            kstack + 16384 > 0xFFFFFFFFULL)
+        {
+            debug_printf("[boot] smp: cpu %u setup failed (OOM)\n",
+                         (unsigned)i);
+            continue;
+        }
+
+        ap_ctx[i].kernel_stack_top = kstack + 16384;
+        ap_ctx[i].syscall_stack_top = sstack + 16384;
+        ap_ctx[i].gdt = gdt;
+        ap_ctx[i].tss = tss;
+
+        gdt_build_ap(gdt, tss, ap_ctx[i].kernel_stack_top);
+
+        volatile uint32_t *slot = (volatile uint32_t *)
+            (TRAMP_BASE + TRAMP_CPU_TABLE_OFF + (uintptr_t)i * 8);
+        slot[0] = (uint32_t)ap_ctx[i].kernel_stack_top;
+        slot[1] = c->lapic_id;
+    }
+
+    // INIT + double SIPI per AP (Intel SDM: 10 ms gap after INIT, ~200 us
+    // between the two SIPIs; a single SIPI is legal but the second one is
+    // a robustness tradition)
+    for (uint32_t i = 0; i < count; i++)
+    {
+        const smp_cpu_t *c = smp_cpu_at(i);
+
+        if (!c->enabled || c->bootstrap)
+            continue;
+
+        lapic_send_init_ipi(c->lapic_id);
+        ap_delay_ms(10);
+        lapic_send_sipi(c->lapic_id, TRAMP_SIPI_VECTOR);
+        ap_delay_us(200);
+        lapic_send_sipi(c->lapic_id, TRAMP_SIPI_VECTOR);
+    }
+
+    // wait for every AP to reach the online counter (1 s timeout)
+    uint64_t deadline = scheduler_ticks() + 100;
+
+    while (g_ap_online < expected && scheduler_ticks() < deadline)
+        pause_cpu();
+
+    debug_printf("[boot] smp: %u/%u cpus online\n",
+                 (unsigned)g_ap_online, (unsigned)expected);
 }

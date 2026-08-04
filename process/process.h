@@ -41,6 +41,7 @@ typedef struct process
     uint64_t pid;
     char name[PROCESS_NAME_MAX];
     process_state_t state;
+    uint32_t cpu;          // which cpu's runqueue this process lives on
     uint64_t cr3;          // page table root (address space)
     uint64_t ticks;        // ticks consumed on the current slice
     uint64_t fs_base;      // FS segment base (mlibc TCB), restored on switch

@@ -51,8 +51,14 @@ extern void irq9(void);  extern void irq10(void); extern void irq11(void);
 extern void irq12(void); extern void irq13(void); extern void irq14(void);
 extern void irq15(void);
 
+// local APIC timer (vector 48): the per-CPU clock on the APs
+extern void lapic_timer_irq(void);
+
 void isr_handler(registers_t *regs);
 void irq_handler(registers_t *regs);
+
+// dispatches the local APIC timer interrupt (EOI is the LAPIC's own)
+void lapic_handler(registers_t *regs);
 
 void irq_install_handler(int irq_num, isr_handler_t handler);
 void irq_uninstall_handler(int irq_num);

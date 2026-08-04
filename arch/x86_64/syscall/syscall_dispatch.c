@@ -400,8 +400,8 @@ void syscall_dispatch(syscall_regs_t *regs) {
             }
 
             scheduler_enqueue(child);
-            debug_printf("[syscall] spawned pid %lu running %s\n",
-                         child->pid, path);
+            debug_printf("[syscall] spawned pid %lu running %s on cpu %u\n",
+                         child->pid, path, (unsigned)child->cpu);
             regs->rax = child->pid;
             break;
         }

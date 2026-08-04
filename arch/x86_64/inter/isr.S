@@ -84,6 +84,15 @@ IRQ 13, 45 # FPU
 IRQ 14, 46 # Primary ATA
 IRQ 15, 47 # Secondary ATA
 
+# Local APIC timer (vector 48, see lapic.h): same register save/restore
+# as the IRQs but its EOI is the LAPIC EOI register, not the 8259 PIC,
+# so it gets its own stub + common stub.
+.global lapic_timer_irq
+lapic_timer_irq:
+    pushq $0
+    pushq $48
+    jmp lapic_common_stub
+
 
 .extern isr_handler
 .extern irq_handler
@@ -146,6 +155,45 @@ irq_common_stub:
 
     mov %rsp, %rdi
     call irq_handler
+
+    popq %rax
+    popq %rbx
+    popq %rcx
+    popq %rdx
+    popq %rsi
+    popq %rdi
+    popq %rbp
+    popq %r8
+    popq %r9
+    popq %r10
+    popq %r11
+    popq %r12
+    popq %r13
+    popq %r14
+    popq %r15
+
+    add $16, %rsp
+    iretq
+
+lapic_common_stub:
+    pushq %r15
+    pushq %r14
+    pushq %r13
+    pushq %r12
+    pushq %r11
+    pushq %r10
+    pushq %r9
+    pushq %r8
+    pushq %rbp
+    pushq %rdi
+    pushq %rsi
+    pushq %rdx
+    pushq %rcx
+    pushq %rbx
+    pushq %rax
+
+    mov %rsp, %rdi
+    call lapic_handler
 
     popq %rax
     popq %rbx

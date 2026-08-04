@@ -36,6 +36,7 @@
 #include "../fs/ext2.h"
 #include "../scheduler/scheduler.h"
 #include "../arch/x86_64/smp/smp.h"
+#include "../arch/x86_64/smp/lapic.h"
 #include "../process/process.h"
 #include "debug.h"
 #include "startup.h"
@@ -63,18 +64,16 @@ static void launch_userspace(void)
         return;
     }
 
-    scheduler_enqueue(init);
+    scheduler_enqueue_on(init, 0);
     debug_printf("[boot] entering ring3 userspace (pid=%lu)\n", init->pid);
 
-    init->ticks = 0;
-    init->state = PROC_RUNNING;
-    process_set_current(init);
-
-    write_cr3(init->cr3);
     debug_printf("[boot] ctx rip=0x%lx cs=0x%lx rflags=0x%lx rsp=0x%lx ss=0x%lx\n",
                  init->ctx.rip, init->ctx.cs, init->ctx.rflags,
                  init->ctx.user_rsp, init->ctx.ss);
-    usermode_resume_full(&init->ctx);
+
+    // the BSP parks here; its PIT timer picks up /init from the local
+    // runqueue and iretq's into ring3 on the next tick
+    scheduler_idle_cpu();
 }
 
 void startup() {
@@ -152,6 +151,12 @@ void startup() {
 
     sti();
     debug_printf("[boot] interrupts enabled, kernel ready\n");
+
+    // local APIC + LAPIC timer calibration (measured against the now
+    // running 100 Hz PIT), then INIT-SIPI the application processors
+    lapic_init();
+    uint32_t lapic_tick = lapic_calibrate();
+    smp_start_aps(lapic_tick);
 
     /* Launch userspace init from the FAT32 partition */
     launch_userspace();

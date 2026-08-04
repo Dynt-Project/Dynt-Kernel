@@ -23,6 +23,11 @@
 
 static uint64_t kernel_cr3;
 
+// MMIO base of the local APIC (see paging_map_lapic).  Kept here so new
+// address spaces can clone the mapping and free_user_tree() never frees
+// the MMIO "frames" behind it.
+static uint64_t g_lapic_base;
+
 void paging_init(void)
 {
     kernel_cr3 = read_cr3();
@@ -31,6 +36,18 @@ void paging_init(void)
 uint64_t paging_kernel_cr3(void)
 {
     return kernel_cr3;
+}
+
+void paging_map_lapic(uint64_t phys)
+{
+    if (g_lapic_base)
+        return;
+
+    g_lapic_base = phys;
+
+    // map the 2 MiB region around the LAPIC as a supervisor huge page
+    // (present|writable, no user bit) in the kernel root
+    paging_map_large(kernel_cr3, phys, phys, PAGING_FLAG_WRITABLE);
 }
 
 static void invlpg(uint64_t vaddr)
@@ -69,6 +86,12 @@ uint64_t paging_new_address_space(void)
 
     ((uint64_t *)pml4)[0] = pdpt | 0x07;  // present | writable | user
 
+    // the LAPIC MMIO page must be reachable from kernel code under ANY
+    // cr3 (a per-cpu timer IRQ fires while a user page table is active)
+    if (g_lapic_base)
+        paging_map_large(pml4, g_lapic_base, g_lapic_base,
+                         PAGING_FLAG_WRITABLE);
+
     return pml4;
 }
 
@@ -80,6 +103,10 @@ static void free_user_tree(uint64_t cr3)
     for (int i = 1; i < 512; i++)
     {
         if (!(pdpt[i] & 1))
+            continue;
+
+        // never free the LAPIC MMIO "frames" behind a kernel device map
+        if (g_lapic_base && (uint32_t)i == (uint32_t)(g_lapic_base >> 30))
             continue;
 
         uint64_t *pd = (uint64_t *)(pdpt[i] & ~0xFFFULL);

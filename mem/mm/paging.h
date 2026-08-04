@@ -24,6 +24,10 @@ void paging_init(void);
 
 uint64_t paging_kernel_cr3(void);
 
+// maps the local APIC MMIO region (supervisor huge page) in the kernel
+// root; every paging_new_address_space() clones the mapping afterwards
+void paging_map_lapic(uint64_t phys);
+
 // creates a fresh address space: kernel identity (supervisor) + empty
 // user half. returns the new pml4 physical address or 0
 uint64_t paging_new_address_space(void);

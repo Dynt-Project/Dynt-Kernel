@@ -69,6 +69,12 @@ void gdt_init(void);
 
 void tss_set_kernel_stack(uint64_t rsp0);
 
+// builds a complete GDT + TSS into caller buffers (per-cpu AP tables)
+void gdt_build_ap(gdt_entry_t *ap_gdt, tss_t *ap_tss, uint64_t rsp0);
+
+// loads `ap_gdt` and its TSS selector on the calling cpu (AP bring-up)
+void gdt_load_cpu(gdt_entry_t *ap_gdt);
+
 #ifdef __cplusplus
 }
 #endif

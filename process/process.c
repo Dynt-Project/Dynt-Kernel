@@ -9,18 +9,17 @@
 #include "../mem/mm/kheap.h"
 #include "../mem/lib/memory.h"
 #include "../arch/x86_64/cpu/msr.h"
+#include "../arch/x86_64/cpu/percpu.h"
 #include "../init/debug.h"
 
 #define PIE_BASE_MIN PAGING_USER_BASE          // 1 GiB
 #define PIE_BASE_RANGE (512ULL * 1024 * 1024)  // 512 MiB of bases
 #define PROCESS_KSTACK_SIZE (16 * 1024)
 
-static process_t *current;
 static uint64_t next_pid = 1;
 
 void process_init(void)
 {
-    current = 0;
     next_pid = 1;
 }
 
@@ -29,14 +28,16 @@ uint64_t process_next_pid(void)
     return next_pid;
 }
 
+// the "current" process is per-cpu (SMP): each core tracks the process
+// it is running in its own percpu struct
 process_t *process_current(void)
 {
-    return current;
+    return (process_t *)percpu_current()->current;
 }
 
 void process_set_current(process_t *proc)
 {
-    current = proc;
+    percpu_current()->current = proc;
 }
 
 // weak pseudo-random PIE base, deterministic per pid
@@ -637,7 +638,7 @@ bool process_execve(process_t *proc, const char *path, char *const argv[],
 
 process_t *process_fork(void)
 {
-    process_t *parent = current;
+    process_t *parent = process_current();
     if (!parent)
         return 0;
 

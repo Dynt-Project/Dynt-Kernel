@@ -78,6 +78,16 @@ void idt_init(void) {
     idt_set_gate(45, (uint64_t)irq13, GDT_SEL_KCODE, 0, IDT_GATE_INTERRUPT);
     idt_set_gate(46, (uint64_t)irq14, GDT_SEL_KCODE, 0, IDT_GATE_INTERRUPT);
     idt_set_gate(47, (uint64_t)irq15, GDT_SEL_KCODE, 0, IDT_GATE_INTERRUPT);
+
+    // local APIC timer (per-CPU clock, APs)
+    idt_set_gate(48, (uint64_t)lapic_timer_irq, GDT_SEL_KCODE, 0,
+                 IDT_GATE_INTERRUPT);
     
     idt_flush((uint64_t)&idtr);
+}
+
+void idt_get_ptr(uint64_t *base, uint16_t *limit)
+{
+    *base = idtr.base;
+    *limit = idtr.limit;
 }
