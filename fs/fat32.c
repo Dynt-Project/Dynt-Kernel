@@ -106,6 +106,7 @@ uint32_t fat32_read(fat32_ctx_t *ctx, uint32_t start_cluster,
         return 0;
 
     uint8_t *dst = (uint8_t *)buffer;
+    uint8_t *tmp = 0;
     uint32_t total = 0;
     uint32_t cluster = start_cluster;
 
@@ -119,13 +120,30 @@ uint32_t fat32_read(fat32_ctx_t *ctx, uint32_t start_cluster,
 
         uint32_t sectors = chunk / ctx->bytes_per_sector;
 
-        if (sectors > 0 &&
-            !block_read(ctx->dev, cluster_to_lba(ctx, cluster), sectors, dst + total))
-            break;
+        if (sectors > 0 && (chunk % ctx->bytes_per_sector) == 0)
+        {
+            if (!block_read(ctx->dev, cluster_to_lba(ctx, cluster), sectors, dst + total))
+                break;
+        }
+        else
+        {
+            if (!tmp)
+                tmp = (uint8_t *)kheap_alloc(ctx->bytes_per_cluster, 16);
+
+            if (!tmp ||
+                !block_read(ctx->dev, cluster_to_lba(ctx, cluster),
+                            ctx->sectors_per_cluster, tmp))
+                break;
+
+            k_memcpy(dst + total, tmp, chunk);
+        }
 
         total += chunk;
         cluster = fat_read_entry(ctx, cluster);
     }
+
+    if (tmp)
+        kheap_free(tmp);
 
     return total;
 }
@@ -161,6 +179,70 @@ static void build_short_name(const uint8_t *entry, char *out, uint32_t out_size)
     }
 
     out[pos] = 0;
+}
+
+static bool fat_write_entry(const fat32_ctx_t *ctx, uint32_t cluster, uint32_t value)
+{
+    uint32_t entry_lba = ctx->fat_start + (cluster * 4) / ctx->bytes_per_sector;
+    uint32_t entry_off = (cluster * 4) % ctx->bytes_per_sector;
+
+    if (!block_read(ctx->dev, entry_lba, 1, fat_sector))
+        return false;
+
+    uint32_t cur = k_le32(fat_sector + entry_off);
+    uint32_t newval = (cur & 0xF0000000u) | (value & 0x0FFFFFFFu);
+
+    fat_sector[entry_off + 0] = (uint8_t)(newval);
+    fat_sector[entry_off + 1] = (uint8_t)(newval >> 8);
+    fat_sector[entry_off + 2] = (uint8_t)(newval >> 16);
+    fat_sector[entry_off + 3] = (uint8_t)(newval >> 24);
+
+    return block_write(ctx->dev, entry_lba, 1, fat_sector);
+}
+
+static uint32_t fat32_find_free(const fat32_ctx_t *ctx)
+{
+    uint32_t total = ctx->fat_size * ctx->bytes_per_sector / 4;
+
+    for (uint32_t cl = 2; cl < total; cl++)
+    {
+        if (fat_read_entry(ctx, cl) == 0)
+            return cl;
+    }
+
+    return 0;
+}
+
+static uint32_t fat32_alloc_cluster(const fat32_ctx_t *ctx)
+{
+    uint32_t cl = fat32_find_free(ctx);
+
+    if (cl == 0)
+        return 0;
+
+    if (!fat_write_entry(ctx, cl, FAT32_EOC))
+        return 0;
+
+    return cl;
+}
+
+static void fat32_free_chain(const fat32_ctx_t *ctx, uint32_t start)
+{
+    uint32_t cl = start;
+    uint32_t guard = 0;
+
+    while (cluster_valid(cl) && guard++ < 0x1000000u)
+    {
+        uint32_t next = fat_read_entry(ctx, cl);
+
+        if (!fat_write_entry(ctx, cl, 0))
+            break;
+
+        if (next == cl || next >= FAT32_BAD)
+            break;
+
+        cl = next;
+    }
 }
 
 static bool name_matches(const char *a, const char *b)
@@ -288,6 +370,259 @@ static bool find_entry(fat32_ctx_t *ctx, uint32_t dir_cluster,
     return search.found;
 }
 
+typedef struct fat32_entry_loc
+{
+    fat32_dirent_t d;
+    uint32_t cluster;
+    uint32_t offset;
+} fat32_entry_loc_t;
+
+static bool locate_entry(fat32_ctx_t *ctx, uint32_t dir_cluster,
+                         const char *name, fat32_entry_loc_t *out)
+{
+    if (!ctx || !name || !out)
+        return false;
+
+    uint8_t *buf = (uint8_t *)kheap_alloc(ctx->bytes_per_cluster, 16);
+
+    if (!buf)
+        return false;
+
+    uint32_t cluster = dir_cluster;
+    bool found = false;
+    bool end = false;
+
+    while (cluster_valid(cluster) && !end)
+    {
+        if (!block_read(ctx->dev, cluster_to_lba(ctx, cluster),
+                        ctx->sectors_per_cluster, buf))
+            break;
+
+        uint32_t count = ctx->bytes_per_cluster / 32;
+
+        for (uint32_t i = 0; i < count; i++)
+        {
+            const uint8_t *entry = buf + i * 32;
+
+            if (entry[0] == 0x00)
+            {
+                end = true;
+                break;
+            }
+
+            if (entry[0] == 0xE5)
+                continue;
+
+            if (entry_to_dirent(entry, &out->d) &&
+                name_matches(out->d.name, name))
+            {
+                out->cluster = cluster;
+                out->offset = i * 32;
+                found = true;
+                break;
+            }
+        }
+
+        if (!end && !found)
+            cluster = fat_read_entry(ctx, cluster);
+    }
+
+    kheap_free(buf);
+    return found;
+}
+
+static bool dir_find_free(fat32_ctx_t *ctx, uint32_t dir_cluster,
+                          uint32_t *out_cluster, uint32_t *out_offset)
+{
+    uint8_t *buf = (uint8_t *)kheap_alloc(ctx->bytes_per_cluster, 16);
+
+    if (!buf)
+        return false;
+
+    uint32_t cluster = dir_cluster;
+    uint32_t last_cluster = dir_cluster;
+    bool found = false;
+
+    while (cluster_valid(cluster))
+    {
+        if (!block_read(ctx->dev, cluster_to_lba(ctx, cluster),
+                        ctx->sectors_per_cluster, buf))
+            break;
+
+        uint32_t count = ctx->bytes_per_cluster / 32;
+
+        for (uint32_t i = 0; i < count; i++)
+        {
+            uint8_t b0 = buf[i * 32];
+
+            if (b0 == 0x00 || b0 == 0xE5)
+            {
+                *out_cluster = cluster;
+                *out_offset = i * 32;
+                found = true;
+                break;
+            }
+        }
+
+        if (found)
+            break;
+
+        last_cluster = cluster;
+        cluster = fat_read_entry(ctx, cluster);
+    }
+
+    kheap_free(buf);
+
+    if (found)
+        return true;
+
+    uint32_t newcl = fat32_alloc_cluster(ctx);
+
+    if (!newcl)
+        return false;
+
+    if (!fat_write_entry(ctx, last_cluster, newcl))
+    {
+        fat32_free_chain(ctx, newcl);
+        return false;
+    }
+
+    uint8_t *zbuf = (uint8_t *)kheap_alloc(ctx->bytes_per_cluster, 16);
+
+    if (!zbuf)
+        return false;
+
+    k_memset(zbuf, 0, ctx->bytes_per_cluster);
+    bool ok = block_write(ctx->dev, cluster_to_lba(ctx, newcl),
+                          ctx->sectors_per_cluster, zbuf);
+    kheap_free(zbuf);
+
+    if (!ok)
+    {
+        fat32_free_chain(ctx, newcl);
+        return false;
+    }
+
+    *out_cluster = newcl;
+    *out_offset = 0;
+    return true;
+}
+
+static bool valid_short_char(uint8_t c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return true;
+    if (c >= '0' && c <= '9')
+        return true;
+    if (c == '_' || c == '-' || c == '!' || c == '$' || c == '^')
+        return true;
+    return false;
+}
+
+static bool encode_short_name(const char *name, uint8_t out[11])
+{
+    const char *p = name;
+    uint32_t base_len = 0;
+    uint32_t ext_len = 0;
+    uint32_t ext_start = (uint32_t)-1;
+
+    for (uint32_t i = 0; p[i] != 0; i++)
+    {
+        if (p[i] == '.')
+            ext_start = i;
+    }
+
+    if (ext_start == 0)
+        return false;
+
+    for (uint32_t i = 0; i < 11; i++)
+        out[i] = ' ';
+
+    uint32_t pos = 0;
+
+    while (*p && pos < 8)
+    {
+        if (ext_start != (uint32_t)-1 && pos == ext_start)
+            break;
+
+        uint8_t c = (uint8_t)*p++;
+
+        if (c >= 'a' && c <= 'z')
+            c = (uint8_t)(c - 'a' + 'A');
+
+        if (!valid_short_char(c))
+            return false;
+
+        out[pos++] = c;
+        base_len++;
+    }
+
+    if (base_len == 0)
+        return false;
+
+    if (ext_start != (uint32_t)-1)
+    {
+        const char *e = name + ext_start + 1;
+
+        for (uint32_t i = 0; i < 3 && *e; i++)
+        {
+            uint8_t c = (uint8_t)*e++;
+
+            if (c >= 'a' && c <= 'z')
+                c = (uint8_t)(c - 'a' + 'A');
+
+            if (!valid_short_char(c))
+                return false;
+
+            out[8 + i] = c;
+            ext_len++;
+        }
+    }
+
+    (void)ext_len;
+    return true;
+}
+
+static bool write_dir_entry_at(fat32_ctx_t *ctx, uint32_t cluster,
+                               uint32_t offset, const char *name,
+                               uint32_t first_cluster, uint32_t size)
+{
+    uint8_t *buf = (uint8_t *)kheap_alloc(ctx->bytes_per_cluster, 16);
+
+    if (!buf)
+        return false;
+
+    if (!block_read(ctx->dev, cluster_to_lba(ctx, cluster),
+                    ctx->sectors_per_cluster, buf))
+    {
+        kheap_free(buf);
+        return false;
+    }
+
+    uint8_t *e = buf + offset;
+
+    if (!encode_short_name(name, e))
+    {
+        kheap_free(buf);
+        return false;
+    }
+
+    e[11] = 0x20;
+    e[20] = (uint8_t)((first_cluster >> 16) & 0xFF);
+    e[21] = (uint8_t)((first_cluster >> 24) & 0xFF);
+    e[26] = (uint8_t)(first_cluster & 0xFF);
+    e[27] = (uint8_t)((first_cluster >> 8) & 0xFF);
+    e[28] = (uint8_t)(size & 0xFF);
+    e[29] = (uint8_t)((size >> 8) & 0xFF);
+    e[30] = (uint8_t)((size >> 16) & 0xFF);
+    e[31] = (uint8_t)((size >> 24) & 0xFF);
+
+    bool ok = block_write(ctx->dev, cluster_to_lba(ctx, cluster),
+                          ctx->sectors_per_cluster, buf);
+    kheap_free(buf);
+    return ok;
+}
+
 static bool split_component(const char **path, char *out, uint32_t out_size)
 {
     const char *p = *path;
@@ -310,6 +645,119 @@ static bool split_component(const char **path, char *out, uint32_t out_size)
     out[pos] = 0;
     *path = p;
     return pos != 0;
+}
+
+bool fat32_write_file(fat32_ctx_t *ctx, const char *path,
+                      const void *buffer, uint32_t size)
+{
+    if (!ctx || !path || (size > 0 && !buffer))
+        return false;
+
+    char components[8][FAT32_NAME_MAX];
+    uint32_t depth = 0;
+    const char *p = path;
+    char comp[FAT32_NAME_MAX];
+
+    while (split_component(&p, comp, sizeof(comp)))
+    {
+        if (depth >= 8)
+            return false;
+
+        k_strncpy(components[depth], comp, sizeof(components[depth]));
+        depth++;
+    }
+
+    if (depth == 0)
+        return false;
+
+    uint32_t dir_cluster = ctx->root_cluster;
+
+    for (uint32_t i = 0; i + 1 < depth; i++)
+    {
+        fat32_dirent_t e;
+
+        if (!find_entry(ctx, dir_cluster, components[i], &e) || !e.is_dir)
+            return false;
+
+        dir_cluster = e.first_cluster;
+    }
+
+    fat32_entry_loc_t loc;
+    bool exists = locate_entry(ctx, dir_cluster, components[depth - 1], &loc);
+
+    uint8_t *cbuf = (uint8_t *)kheap_alloc(ctx->bytes_per_cluster, 16);
+
+    if (!cbuf)
+        return false;
+
+    uint32_t first_cluster = 0;
+    uint32_t prev = 0;
+    uint32_t total = (size + ctx->bytes_per_cluster - 1) / ctx->bytes_per_cluster;
+    bool ok = true;
+
+    for (uint32_t i = 0; i < total; i++)
+    {
+        uint32_t cl = fat32_alloc_cluster(ctx);
+
+        if (!cl)
+        {
+            ok = false;
+            break;
+        }
+
+        if (!first_cluster)
+        {
+            first_cluster = cl;
+        }
+        else if (!fat_write_entry(ctx, prev, cl))
+        {
+            fat32_free_chain(ctx, first_cluster);
+            ok = false;
+            break;
+        }
+
+        uint32_t chunk = ctx->bytes_per_cluster;
+        uint32_t left = size - i * ctx->bytes_per_cluster;
+
+        if (chunk > left)
+            chunk = left;
+
+        k_memset(cbuf, 0, ctx->bytes_per_cluster);
+        k_memcpy(cbuf, (const uint8_t *)buffer + i * ctx->bytes_per_cluster, chunk);
+
+        if (!block_write(ctx->dev, cluster_to_lba(ctx, cl),
+                         ctx->sectors_per_cluster, cbuf))
+        {
+            fat32_free_chain(ctx, first_cluster);
+            ok = false;
+            break;
+        }
+
+        prev = cl;
+    }
+
+    kheap_free(cbuf);
+
+    if (!ok)
+        return false;
+
+    if (exists)
+    {
+        if (loc.d.first_cluster >= 2)
+            fat32_free_chain(ctx, loc.d.first_cluster);
+
+        return write_dir_entry_at(ctx, loc.cluster, loc.offset,
+                                  components[depth - 1], first_cluster, size);
+    }
+
+    uint32_t slot_cluster;
+    uint32_t slot_offset;
+
+    if (!dir_find_free(ctx, dir_cluster, &slot_cluster, &slot_offset))
+        return false;
+
+    return write_dir_entry_at(ctx, slot_cluster, slot_offset,
+                              components[depth - 1], first_cluster, size);
 }
 
 bool fat32_open(fat32_ctx_t *ctx, const char *name, fat32_dirent_t *out)
@@ -399,7 +847,16 @@ static int32_t fat32_vfs_read_file(void *vctx, const char *path,
     if (!fat32_open(ctx, path, &entry) || entry.is_dir)
         return -1;
 
+    if (entry.size < buffer_size)
+        buffer_size = entry.size;
+
     return (int32_t)fat32_read(ctx, entry.first_cluster, buffer, buffer_size);
+}
+
+static bool fat32_vfs_write_file(void *vctx, const char *path,
+                                 const void *buffer, uint32_t size)
+{
+    return fat32_write_file((fat32_ctx_t *)vctx, path, buffer, size);
 }
 
 static void fat32_vfs_list_dir(void *vctx, const char *path,
@@ -425,6 +882,7 @@ void fat32_register(void)
     fs.probe = fat32_probe;
     fs.mount = fat32_vfs_mount;
     fs.read_file = fat32_vfs_read_file;
+    fs.write_file = fat32_vfs_write_file;
     fs.list_dir = fat32_vfs_list_dir;
     vfs_register_fs(&fs);
 }

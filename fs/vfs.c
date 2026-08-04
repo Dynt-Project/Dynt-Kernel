@@ -164,6 +164,18 @@ int32_t vfs_read_file(const char *path, void *buffer, uint32_t buffer_size)
     return m->fs->read_file(m->fs_data, rel, buffer, buffer_size);
 }
 
+bool vfs_write_file(const char *path, const void *buffer, uint32_t size)
+{
+    vfs_mount_t *m = vfs_find_mount(path);
+
+    if (!m || !m->fs || !m->fs->write_file || (size > 0 && !buffer))
+        return false;
+
+    const char *rel = strip_mount_prefix(m, path);
+
+    return m->fs->write_file(m->fs_data, rel, buffer, size);
+}
+
 void vfs_list_dir(const char *path,
                   void (*callback)(const char *name,
                                    uint32_t size,

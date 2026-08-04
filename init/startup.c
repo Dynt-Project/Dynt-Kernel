@@ -140,6 +140,14 @@ void startup() {
     uint32_t mounts = vfs_mount_all();
     debug_printf("[boot] vfs mounts: %u\n", (unsigned)mounts);
 
+    static const char test_data[] = "Hello from Dynt kernel FAT32 write!\n";
+    bool wrote = vfs_write_file("/dynttest.txt", test_data, sizeof(test_data) - 1);
+    char readbuf[128];
+    int32_t readback = vfs_read_file("/dynttest.txt", readbuf, sizeof(readbuf));
+    readbuf[sizeof(readbuf) - 1] = 0;
+    debug_printf("[boot] fat32 write: %s, readback %d bytes: %s\n",
+                 wrote ? "ok" : "FAIL", (int)readback, readbuf);
+
     // syscall handlers run on their own stack so that an IRQ frame
     // (pushed at TSS rsp0) can never clobber the syscall register save
     percpu_init((uint64_t)syscall_stack_top);

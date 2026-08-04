@@ -40,6 +40,8 @@ bool fat32_mount(block_device_t *dev, fat32_ctx_t **out_ctx);
 bool fat32_open(fat32_ctx_t *ctx, const char *name, fat32_dirent_t *out);
 uint32_t fat32_read(fat32_ctx_t *ctx, uint32_t start_cluster,
                     void *buffer, uint32_t buffer_size);
+bool fat32_write_file(fat32_ctx_t *ctx, const char *path,
+                      const void *buffer, uint32_t size);
 void fat32_list(fat32_ctx_t *ctx,
                 void (*callback)(const fat32_dirent_t *entry, void *user),
                 void *user);

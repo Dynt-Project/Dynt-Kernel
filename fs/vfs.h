@@ -14,6 +14,8 @@ typedef bool (*vfs_probe_fn)(block_device_t *dev);
 typedef bool (*vfs_mount_fn)(block_device_t *dev, void **out_ctx);
 typedef int32_t (*vfs_read_file_fn)(void *ctx, const char *path,
                                     void *buffer, uint32_t buffer_size);
+typedef bool (*vfs_write_file_fn)(void *ctx, const char *path,
+                                  const void *buffer, uint32_t size);
 typedef void (*vfs_list_dir_fn)(void *ctx, const char *path,
                                 void (*callback)(const char *name,
                                                  uint32_t size,
@@ -27,6 +29,7 @@ typedef struct vfs_fs_type
     vfs_probe_fn probe;
     vfs_mount_fn mount;
     vfs_read_file_fn read_file;
+    vfs_write_file_fn write_file;
     vfs_list_dir_fn list_dir;
     struct vfs_fs_type *next;
 } vfs_fs_type_t;
@@ -52,6 +55,7 @@ vfs_mount_t *vfs_mount_first(void);
 vfs_mount_t *vfs_find_mount(const char *path);
 
 int32_t vfs_read_file(const char *path, void *buffer, uint32_t buffer_size);
+bool vfs_write_file(const char *path, const void *buffer, uint32_t size);
 void vfs_list_dir(const char *path,
                   void (*callback)(const char *name,
                                    uint32_t size,
