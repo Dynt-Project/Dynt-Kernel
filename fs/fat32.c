@@ -3,7 +3,6 @@
 #include "vfs.h"
 #include "../mem/lib/memory.h"
 #include "../mem/mm/kheap.h"
-#include "../init/debug.h"
 
 #define FAT32_EOC 0x0FFFFFF8
 #define FAT32_BAD 0x0FFFFFF7

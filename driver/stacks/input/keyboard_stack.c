@@ -142,6 +142,8 @@ void tty_input_char(char c)
 
     if (c == '\n')
     {
+        if (tty_len < TTY_LINE_MAX - 1)
+            tty_line[tty_len++] = '\n';
         tty_line[tty_len] = 0;
         tty_ready = true;
         debug_putc('\n');

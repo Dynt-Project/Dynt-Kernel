@@ -2,8 +2,8 @@
 #include <unistd.h>
 
 int main(void) {
+    printf("Enter your name: ");
     char name[50];
-    printf("Gib deinen Namen ein: ");
 
     if (fgets(name, sizeof(name), stdin) != NULL) {
         printf("Hallo, %s", name);
