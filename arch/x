@@ -1,0 +1,193 @@
+// Written by [@saphhic](https://github.com/saphhic)  
+// Date: 26 July 2026
+// Modified by @epaxgamingtv
+
+//   Expanded syscall dispatch — supports write, read (keyboard),
+//   read_file (VFS), list_dir (VFS), exec (ELF loader), getpid.
+
+#include "syscall.h"
+#include "../io/serial.h"
+#include "../cpu/cpu.h"
+#include "../../../driver/stacks/input/keyboard_stack.h"
+#include "../../../fs/vfs.h"
+#include "../../../exec/elf.h"
+#include "../../../mem/mm/kheap.h"
+#include "../../../init/debug.h"
+
+#include <stdint.h>
+
+static uint64_t next_pid = 1;
+
+/* Trampoline for SYS_LIST_DIR: writes each entry to a user buffer */
+struct list_dir_state
+{
+    char *buf;       /* user buffer */
+    uint32_t size;   /* buffer size */
+    uint32_t offset; /* current write position */
+};
+
+static void list_dir_callback(const char *name,
+                              uint32_t size,
+                              bool is_dir,
+                              void *user)
+{
+    struct list_dir_state *st = (struct list_dir_state *)user;
+
+    /* Write "name size type\n" for each entry */
+    uint32_t i = 0;
+    while (name[i] && st->offset + 1 < st->size)
+    {
+        st->buf[st->offset++] = name[i++];
+    }
+
+    /* Append directory marker */
+    if (st->offset + 4 < st->size)
+    {
+        st->buf[st->offset++] = ' ';
+        st->buf[st->offset++] = is_dir ? 'D' : 'F';
+        st->buf[st->offset++] = ' ';
+        /* Write size as decimal */
+        char numbuf[16];
+        int nlen = 0;
+        uint32_t s = size;
+        if (s == 0)
+        {
+            numbuf[nlen++] = '0';
+        }
+        while (s > 0 && nlen < 16)
+        {
+            numbuf[nlen++] = '0' + (s % 10);
+            s /= 10;
+        }
+        while (nlen > 0 && st->offset + 1 < st->size)
+            st->buf[st->offset++] = numbuf[--nlen];
+        st->buf[st->offset++] = '\n';
+    }
+}
+
+void syscall_dispatch(syscall_regs_t *regs) {
+    switch (regs->rax) {
+
+        case SYS_WRITE: {
+            const char *str = (const char *)regs->rdi;
+            uint64_t len = regs->rsi;
+
+            if (len == 0)
+                len = k_strlen(str);
+
+            for (uint64_t i = 0; i < len; i++)
+                serial_write_char(str[i]);
+
+            regs->rax = len;
+            break;
+        }
+
+        case SYS_READ: {
+            char *buf = (char *)regs->rdi;
+            uint64_t len = regs->rsi;
+
+            uint64_t i = 0;
+            for (; i < len; i++)
+            {
+                char c = keyboard_getchar();
+                if (c == 0)
+                    break;
+                buf[i] = c;
+            }
+
+            regs->rax = i;
+            break;
+        }
+
+        case SYS_READ_FILE: {
+            const char *path = (const char *)regs->rdi;
+            void *buf = (void *)regs->rsi;
+            uint32_t bufsize = (uint32_t)regs->rdx;
+
+            int32_t ret = vfs_read_file(path, buf, bufsize);
+            regs->rax = (uint64_t)(int64_t)ret;
+            break;
+        }
+
+        case SYS_LIST_DIR: {
+            const char *path = (const char *)regs->rdi;
+            char *buf = (char *)regs->rsi;
+            uint32_t bufsize = (uint32_t)regs->rdx;
+
+            struct list_dir_state st;
+            st.buf = buf;
+            st.size = bufsize;
+            st.offset = 0;
+
+            vfs_list_dir(path, list_dir_callback, &st);
+
+            if (st.offset < bufsize)
+                buf[st.offset] = 0;
+
+            regs->rax = st.offset;
+            break;
+        }
+
+        case SYS_EXEC: {
+            const char *path = (const char *)regs->rdi;
+
+            /* Read the ELF file from VFS into a kernel buffer */
+            uint8_t *elf_buf = (uint8_t *)kheap_alloc(1024 * 1024, 16);
+            if (!elf_buf)
+            {
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+
+            int32_t elf_size = vfs_read_file(path, elf_buf, 1024 * 1024);
+            if (elf_size <= 0)
+            {
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+
+            debug_printf("[syscall] exec: %s (%d bytes)\n", path, elf_size);
+
+            elf_image_t img;
+            if (!elf64_load_image(elf_buf, (size_t)elf_size, &img))
+            {
+                debug_printf("[syscall] exec: ELF load failed\n");
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+
+            debug_printf("[syscall] exec: entry=0x%p low=0x%p high=0x%p\n",
+                         img.entry, img.low_address, img.high_address);
+
+            /* Allocate a user stack */
+            uint64_t user_stack = (uint64_t)kheap_alloc(65536, 16);
+            if (!user_stack)
+            {
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+            user_stack += 65536 - 16;  /* top of stack, aligned */
+
+            /* Enter ring 3 — does not return */
+            elf64_enter_ring3(&img, user_stack);
+            break;
+        }
+
+        case SYS_GETPID:
+            regs->rax = next_pid++;
+            break;
+
+        case SYS_EXIT:
+           serial_write("\n[syscall] SYS_EXIT, System Halting\n");
+           cli();
+           for (;;) {
+              hlt();
+           }
+           break;
+
+        default:
+           serial_write("\n[syscall] UNKNOWN, unknown syscall number.\n");
+           regs->rax = (uint64_t)-1;
+           break;
+    }
+}

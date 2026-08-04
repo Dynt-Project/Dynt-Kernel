@@ -48,8 +48,11 @@ void gdt_init(void) {
     gdt_set_entry(0, 0, 0, 0, 0);
     gdt_set_entry(1, 0, 0xFFFFF, 0x9A, 0xA0);
     gdt_set_entry(2, 0, 0xFFFFF, 0x92, 0xC0);
-    gdt_set_entry(3, 0, 0xFFFFF, 0xFA, 0xA0);
-    gdt_set_entry(4, 0, 0xFFFFF, 0xF2, 0xC0);
+    /* user data first (0x18), user code right after (0x20): sysretq
+       computes CS = STAR[63:48]+16 and SS = STAR[63:48]+8, so the user
+       code selector must be exactly 8 above the user data selector. */
+    gdt_set_entry(3, 0, 0xFFFFF, 0xF2, 0xC0);
+    gdt_set_entry(4, 0, 0xFFFFF, 0xFA, 0xA0);
 
     for (uint8_t *p = (uint8_t *)&tss; p < (uint8_t *)&tss + sizeof(tss); p++) 
         *p = 0;

@@ -1,0 +1,383 @@
+#include "fat32.h"
+
+#include "vfs.h"
+#include "../mem/lib/memory.h"
+#include "../mem/mm/kheap.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+
+/* FAT32 attributes */
+#define FAT_ATTR_READ_ONLY 0x01
+#define FAT_ATTR_HIDDEN    0x02
+#define FAT_ATTR_SYSTEM    0x04
+#define FAT_ATTR_VOLUME_ID 0x08
+#define FAT_ATTR_DIRECTORY 0x10
+#define FAT_ATTR_ARCHIVE   0x20
+#define FAT_ATTR_LFN       0x0F
+
+/* FAT32 end-of-chain marker */
+#define FAT32_EOC 0x0FFFFFF8
+#define FAT32_BAD  0x0FFFFFF7
+
+/* Sector buffers — two so we can read FAT and data without clobbering */
+static uint8_t fat_buf[512];
+static uint8_t dir_buf[512];
+
+/* ---- low-level helpers ---- */
+
+static bool read_sector(block_device_t *dev, uint64_t lba, void *buf)
+{
+    return block_read(dev, lba, 1, buf);
+}
+
+static uint32_t fat_entry(fat32_ctx_t *ctx, uint32_t cluster)
+{
+    uint32_t fat_offset = cluster * 4;
+    uint32_t fat_sector = ctx->fat_start + fat_offset / ctx->bytes_per_sector;
+    uint32_t fat_off    = fat_offset % ctx->bytes_per_sector;
+
+    if (!read_sector(ctx->dev, fat_sector, fat_buf))
+        return FAT32_BAD;
+
+    return k_le32(fat_buf + fat_off) & 0x0FFFFFFF;
+}
+
+static uint64_t cluster_to_lba(fat32_ctx_t *ctx, uint32_t cluster)
+{
+    return ctx->data_start + (uint64_t)(cluster - 2) * ctx->sectors_per_cluster;
+}
+
+static bool read_cluster(fat32_ctx_t *ctx, uint32_t cluster, uint8_t *buf)
+{
+    uint64_t lba = cluster_to_lba(ctx, cluster);
+    return block_read(ctx->dev, lba, ctx->sectors_per_cluster, buf);
+}
+
+/* ---- 8.3 name helpers ---- */
+
+static bool name_matches(const uint8_t *entry, const char *name)
+{
+    char buf[12];
+    int p = 0;
+
+    for (int i = 0; i < 8; i++)
+    {
+        if (entry[i] == ' ')
+            break;
+        buf[p++] = (char)entry[i];
+    }
+
+    bool has_ext = false;
+    for (int i = 8; i < 11; i++)
+    {
+        if (entry[i] != ' ')
+        {
+            has_ext = true;
+            break;
+        }
+    }
+
+    if (has_ext)
+    {
+        buf[p++] = '.';
+        for (int i = 8; i < 11; i++)
+        {
+            if (entry[i] == ' ')
+                break;
+            buf[p++] = (char)entry[i];
+        }
+    }
+
+    buf[p] = 0;
+
+    for (int i = 0; i <= p; i++)
+    {
+        char a = buf[i];
+        char b = name[i];
+
+        if (a >= 'A' && a <= 'Z')
+            a = (char)(a + 32);
+        if (b >= 'A' && b <= 'Z')
+            b = (char)(b + 32);
+
+        if (a != b)
+            return false;
+    }
+
+    return true;
+}
+
+static void extract_name(const uint8_t *entry, char *out, uint32_t out_size)
+{
+    uint32_t p = 0;
+
+    for (int i = 0; i < 8 && p + 1 < out_size; i++)
+    {
+        if (entry[i] == ' ')
+            break;
+        out[p++] = (char)entry[i];
+    }
+
+    bool has_ext = false;
+    for (int i = 8; i < 11; i++)
+    {
+        if (entry[i] != ' ')
+        {
+            has_ext = true;
+            break;
+        }
+    }
+
+    if (has_ext && p + 1 < out_size)
+    {
+        out[p++] = '.';
+        for (int i = 8; i < 11 && p + 1 < out_size; i++)
+        {
+            if (entry[i] == ' ')
+                break;
+            out[p++] = (char)entry[i];
+        }
+    }
+
+    out[p] = 0;
+}
+
+/* ---- public API ---- */
+
+bool fat32_probe(block_device_t *dev)
+{
+    if (!dev || dev->sector_size != 512)
+        return false;
+
+    if (!read_sector(dev, 0, fat_buf))
+        return false;
+
+    if (fat_buf[510] != 0x55 || fat_buf[511] != 0xAA)
+        return false;
+
+    if (k_memcmp(fat_buf + 82, "FAT32   ", 8) == 0)
+        return true;
+
+    uint16_t reserved = k_le16(fat_buf + 14);
+    uint8_t  fats     = fat_buf[16];
+    uint32_t fat_size = k_le32(fat_buf + 36);
+    uint32_t root_clu = k_le32(fat_buf + 44);
+
+    return reserved != 0 && fats != 0 && fat_size != 0 && root_clu >= 2;
+}
+
+bool fat32_mount(block_device_t *dev, fat32_ctx_t **out_ctx)
+{
+    if (!dev || !out_ctx)
+        return false;
+
+    if (!read_sector(dev, 0, fat_buf))
+        return false;
+
+    fat32_ctx_t *ctx = (fat32_ctx_t *)kheap_alloc(sizeof(fat32_ctx_t), 16);
+    if (!ctx)
+        return false;
+
+    ctx->dev                 = dev;
+    ctx->bytes_per_sector    = k_le16(fat_buf + 11);
+    ctx->sectors_per_cluster = fat_buf[13];
+    ctx->reserved_sectors    = k_le16(fat_buf + 14);
+    ctx->fat_count           = fat_buf[16];
+    ctx->fat_size            = k_le32(fat_buf + 36);
+    ctx->root_cluster        = k_le32(fat_buf + 44);
+    ctx->fat_start           = ctx->reserved_sectors;
+    ctx->data_start          = ctx->reserved_sectors +
+                               ctx->fat_count * ctx->fat_size;
+    ctx->bytes_per_cluster   = ctx->sectors_per_cluster *
+                               ctx->bytes_per_sector;
+
+    if (ctx->bytes_per_sector == 0 || ctx->sectors_per_cluster == 0 ||
+        ctx->fat_size == 0 || ctx->root_cluster < 2)
+    {
+        return false;
+    }
+
+    *out_ctx = ctx;
+    return true;
+}
+
+bool fat32_open(fat32_ctx_t *ctx, const char *name, fat32_dirent_t *out)
+{
+    if (!ctx || !name || !out)
+        return false;
+
+    uint32_t cluster = ctx->root_cluster;
+    uint8_t  *buf = dir_buf;
+
+    while (cluster >= 2 && cluster < FAT32_EOC)
+    {
+        if (!read_cluster(ctx, cluster, buf))
+            return false;
+
+        uint32_t entries = ctx->bytes_per_cluster / 32;
+
+        for (uint32_t i = 0; i < entries; i++)
+        {
+            uint8_t *entry = buf + i * 32;
+
+            if (entry[0] == 0x00)
+                return false;
+            if (entry[0] == 0xE5)
+                continue;
+            if ((entry[11] & FAT_ATTR_LFN) == FAT_ATTR_LFN)
+                continue;
+            if (entry[11] & FAT_ATTR_VOLUME_ID)
+                continue;
+
+            if (name_matches(entry, name))
+            {
+                extract_name(entry, out->name, FAT32_NAME_MAX);
+                out->first_cluster = (uint32_t)k_le16(entry + 20) << 16 |
+                                     k_le16(entry + 26);
+                out->size       = k_le32(entry + 28);
+                out->is_dir     = (entry[11] & FAT_ATTR_DIRECTORY) != 0;
+                return true;
+            }
+        }
+
+        cluster = fat_entry(ctx, cluster);
+    }
+
+    return false;
+}
+
+uint32_t fat32_read(fat32_ctx_t *ctx, uint32_t start_cluster,
+                    void *buffer, uint32_t buffer_size)
+{
+    if (!ctx || !buffer || buffer_size == 0 || start_cluster < 2)
+        return 0;
+
+    uint8_t *dst = (uint8_t *)buffer;
+    uint32_t total = 0;
+    uint32_t cluster = start_cluster;
+
+    uint8_t *cbuf = (uint8_t *)kheap_alloc(ctx->bytes_per_cluster, 16);
+    if (!cbuf)
+        return 0;
+
+    while (cluster >= 2 && cluster < FAT32_EOC && total < buffer_size)
+    {
+        if (!read_cluster(ctx, cluster, cbuf))
+            break;
+
+        uint32_t to_copy = ctx->bytes_per_cluster;
+        if (total + to_copy > buffer_size)
+            to_copy = buffer_size - total;
+
+        k_memcpy(dst + total, cbuf, to_copy);
+        total += to_copy;
+
+        cluster = fat_entry(ctx, cluster);
+    }
+
+    return total;
+}
+
+void fat32_list(fat32_ctx_t *ctx,
+                void (*callback)(const fat32_dirent_t *entry, void *user),
+                void *user)
+{
+    if (!ctx || !callback)
+        return;
+
+    uint32_t cluster = ctx->root_cluster;
+    uint8_t *buf = dir_buf;
+
+    while (cluster >= 2 && cluster < FAT32_EOC)
+    {
+        if (!read_cluster(ctx, cluster, buf))
+            return;
+
+        uint32_t entries = ctx->bytes_per_cluster / 32;
+
+        for (uint32_t i = 0; i < entries; i++)
+        {
+            uint8_t *entry = buf + i * 32;
+
+            if (entry[0] == 0x00)
+                return;
+            if (entry[0] == 0xE5)
+                continue;
+            if ((entry[11] & FAT_ATTR_LFN) == FAT_ATTR_LFN)
+                continue;
+            if (entry[11] & FAT_ATTR_VOLUME_ID)
+                continue;
+
+            fat32_dirent_t dent;
+            k_memset(&dent, 0, sizeof(dent));
+            extract_name(entry, dent.name, FAT32_NAME_MAX);
+            dent.first_cluster = (uint32_t)k_le16(entry + 20) << 16 |
+                                 k_le16(entry + 26);
+            dent.size   = k_le32(entry + 28);
+            dent.is_dir = (entry[11] & FAT_ATTR_DIRECTORY) != 0;
+
+            callback(&dent, user);
+        }
+
+        cluster = fat_entry(ctx, cluster);
+    }
+}
+
+/* ---- VFS glue ---- */
+
+static bool fat32_vfs_mount(block_device_t *dev, void **out_ctx)
+{
+    return fat32_mount(dev, (fat32_ctx_t **)out_ctx);
+}
+
+static int32_t fat32_vfs_read_file(void *ctx, const char *path,
+                                   void *buffer, uint32_t buffer_size)
+{
+    fat32_ctx_t *fctx = (fat32_ctx_t *)ctx;
+    fat32_dirent_t dent;
+
+    if (!fat32_open(fctx, path, &dent))
+        return -1;
+
+    return (int32_t)fat32_read(fctx, dent.first_cluster, buffer, buffer_size);
+}
+
+typedef struct fat32_list_trampoline
+{
+    void (*callback)(const char *name, uint32_t size, bool is_dir, void *user);
+    void *user;
+} fat32_list_trampoline_t;
+
+static void fat32_list_bridge(const fat32_dirent_t *entry, void *user)
+{
+    fat32_list_trampoline_t *t = (fat32_list_trampoline_t *)user;
+    t->callback(entry->name, entry->size, entry->is_dir, t->user);
+}
+
+static void fat32_vfs_list_dir(void *ctx, const char *path,
+                               void (*callback)(const char *name,
+                                                uint32_t size,
+                                                bool is_dir,
+                                                void *user),
+                               void *user)
+{
+    (void)path;
+    fat32_ctx_t *fctx = (fat32_ctx_t *)ctx;
+    fat32_list_trampoline_t t;
+    t.callback = callback;
+    t.user = user;
+    fat32_list(fctx, fat32_list_bridge, &t);
+}
+
+void fat32_register(void)
+{
+    static vfs_fs_type_t fs;
+
+    fs.name      = "fat32";
+    fs.probe     = fat32_probe;
+    fs.mount     = fat32_vfs_mount;
+    fs.read_file = fat32_vfs_read_file;
+    fs.list_dir  = fat32_vfs_list_dir;
+    vfs_register_fs(&fs);
+}

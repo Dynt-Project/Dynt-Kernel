@@ -1,71 +1,73 @@
-# x86_64 Architecture Support
+# Dynt Kernel
 
-Architecture support for the **x86_64** (64-bit) platform.
+Dynt Kernel is an experimental x86_64 kernel project.
 
-Written by [@saphhic](https://github.com/saphhic)  
-Date: 29 July 2026
+## Status
 
-## Overview
-
-This directory contains the x86_64 port of the kernel.  
-It is designed for **UEFI** systems and includes support for the **Limine** bootloader as well as Multiboot.
-
-------------------------------------------------------------------------------------------------------------------------------------------
-[IMPORTANT]: As for now (July 29th) the kernel only contains the provided code, future updates such as drivers, bootloader, terminal etc.
-is espected to be added past July 31st.
-------------------------------------------------------------------------------------------------------------------------------------------
+- Architecture: x86_64
+- Boot protocol: Multiboot2
+- Bootloader for testing: GRUB
+- Language: C/C++ with GAS assembly
+- License: GNU General Public License v3.0
 
 ## Features
 
------ Added July 26th ------
-- I/O ports
-- CPU Instructions
-- Control Registers
-- Model Specific Registers
-- CPU Discovery
-- Memory Ordering
-- RFLAGS
-- Interrupt Control
-- Syscall handler
-- Syscall Functions
-----------------------------
+- Multiboot2 boot header and GRUB test boot
+- 32-bit boot stub with transition to long mode
+- Basic paging setup for early boot
+- GDT and IDT setup
+- Interrupt and exception handling
+- PIC support
+- Serial output
+- VGA text output
+- PS/2 keyboard and mouse code
+- SMP CPU discovery and local APIC enable path
+- BORE-inspired scheduler core
+- Ring 3 ELF64 loader foundation
+- Minimal libc string/memory layer
+- IDE/ATA PIO storage driver
+- AHCI/SATA PCI detection
+- MBR and GPT partition discovery
+- VFS mount registry
+- FAT32 and ext2 filesystem detection
+- Basic syscall structure
+
+## Build
+
+Build the kernel ELF:
+
+```sh
+make kernel
+```
+
+Build a bootable GRUB ISO:
+
+```sh
+make iso
+```
+
+Run it in QEMU:
+
+```sh
+make run
+```
+
+The QEMU run target creates and attaches `build/fat32.img` as a FAT32 IDE disk.
+
+## Layout
+
+- `arch/x86_64/` - architecture-specific boot, CPU, interrupt, and syscall code
+- `boot/grub/` - GRUB test configuration
+- `driver/` - built-in and stack-level driver code
+- `init/` - early kernel startup code
+- `main.c` - main kernel entry after architecture startup
+- `linker.ld` - kernel linker script
+
+## Contributors
+
+See [CONTRIBUTER.md](CONTRIBUTER.md).
 
 ## License
 
-This Directory is under GNU General Public License v3.0 Released on 2007.
-The license is as follows:
-
------------------------------------------------------------------------
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, version 3 of the License.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
------------------------------------------------------------------------
-
-To see the full license check the [LICENSE](LICENSE) file.
-
-## Note [IMPORTANT]
-
-In the boot folder when bootloader is added a boot.asm file is needed, and in the mm folder goes functions such as paging or vmm, keep this in mind. when adding something to x86_64.
-
-The x86 is written in C, i (saphhic) am just used to write files in C++ so all of the C files CAN be changed to C++ files whitout breaking anything, this is because none of these scripts contains C++ memory maneging functions.
-
-The Assembler code is writen in GAS sintax, in the future if you reading this, plan to make a linker script or a Makefile for the whole kernel or OS keep that in mind.
-
-## Contact
-
-If you encounter any issues whit my code feel free to change it, fix it or directly contact me,
-i would aprecieate a lot the feedback!
-
---------------------------------------------------------
-- Email: <thbichosecundario@gmail.com>
-- Github: [@saphhic](https://github.com/saphhic)
-- Project Repository: (https://github.com/Dynt-Project)
---------------------------------------------------------
+This project is licensed under the GNU General Public License v3.0.
+See [LICENSE](LICENSE) for the full license text.

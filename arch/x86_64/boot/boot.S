@@ -113,10 +113,10 @@ _start:
     xorl %eax, %eax
     rep stosl
 
-    // pd[0..511] identity maps 0 - 1 GiB as 2 MiB pages (present, rw, ps)
-    // each entry is 8 bytes in PAE mode, so stride by 8
+    // pd[0..511] identity maps 0 - 1 GiB as 2 MiB pages
+    // (present, rw, user, ps) — bit 2 = user, so ring3 can run code
     movl $boot_pd, %edi
-    movl $0x83, %eax
+    movl $0x87, %eax
     xorl %ebx, %ebx                     // high dword of every entry = 0
     movl $512, %ecx
 1:
@@ -126,17 +126,17 @@ _start:
     addl $8, %edi
     loop 1b
 
-    // pdpt[0] -> boot_pd
+    // pdpt[0] -> boot_pd (present, rw, user)
     movl $boot_pdpt, %edi
     movl $boot_pd, %eax
-    orl $0x03, %eax
+    orl $0x07, %eax
     movl %eax, (%edi)
     movl %ebx, 4(%edi)                  // high dword = 0
 
-    // pml4[0] -> boot_pdpt
+    // pml4[0] -> boot_pdpt (present, rw, user)
     movl $boot_pml4, %edi
     movl $boot_pdpt, %eax
-    orl $0x03, %eax
+    orl $0x07, %eax
     movl %eax, (%edi)
     movl %ebx, 4(%edi)                  // high dword = 0
 

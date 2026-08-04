@@ -58,6 +58,26 @@ static inline uint32_t inl(uint16_t port)
     return value;
 }
 
+static inline void insw(uint16_t port,
+                        void *buffer,
+                        uint32_t count)
+{
+    __asm__ volatile ("rep insw"
+                      : "+D"(buffer), "+c"(count)
+                      : "d"(port)
+                      : "memory");
+}
+
+static inline void outsw(uint16_t port,
+                         const void *buffer,
+                         uint32_t count)
+{
+    __asm__ volatile ("rep outsw"
+                      : "+S"(buffer), "+c"(count)
+                      : "d"(port)
+                      : "memory");
+}
+
 static inline void io_wait(void)
 {
     __asm__ volatile ("outb %%al,$0x80"

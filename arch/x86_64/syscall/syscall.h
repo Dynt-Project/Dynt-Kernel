@@ -28,8 +28,13 @@ struct __attribute__((packed)) syscall_regs_t {
     uint64_t r15;
 };
 
-#define SYS_EXIT 0
-#define SYS_WRITE 1
+#define SYS_EXIT      0
+#define SYS_WRITE     1
+#define SYS_READ      2
+#define SYS_READ_FILE 3
+#define SYS_LIST_DIR  4
+#define SYS_EXEC      5
+#define SYS_GETPID    6
 
 #ifdef __cplusplus
 extern "C" {

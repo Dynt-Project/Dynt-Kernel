@@ -7,6 +7,7 @@
 #include "../inter/isr.h"
 #include "../io/serial.h"
 #include "../cpu/cpu.h"
+#include "../cpu/control_regs.h"
 
 static void print_hex64(uint64_t value) {
     static const char digits[] = "0123456789ABCDEF";
@@ -38,6 +39,11 @@ static void print_hex64(uint64_t value) {
         serial_write("  err="); print_hex64(regs->err_code);
         serial_write("\n");
 
+        if (regs->int_no == 14) {
+            serial_write("cr2="); print_hex64(read_cr2());
+            serial_write("\n");
+        }
+
         serial_write("rip="); print_hex64(regs->rip);
         serial_write("  cs="); print_hex64(regs->cs);
         serial_write("  rflags="); print_hex64(regs->rflags);
@@ -53,6 +59,18 @@ static void print_hex64(uint64_t value) {
         serial_write("  rdi="); print_hex64(regs->rdi);
         serial_write("  rbp="); print_hex64(regs->rbp);
         serial_write("  rsp="); print_hex64(regs->user_rsp);
+        serial_write("\n");
+
+        serial_write("ss="); print_hex64(regs->ss);
+        serial_write("  cr3="); print_hex64(read_cr3());
+        serial_write("\n");
+
+        serial_write("stack: ");
+        const uint64_t *sp = (const uint64_t *)regs->user_rsp;
+        for (int i = 0; i < 8; i++) {
+            print_hex64(sp[i]);
+            serial_write(" ");
+        }
         serial_write("\n");
     }
 

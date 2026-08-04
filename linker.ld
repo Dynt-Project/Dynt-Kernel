@@ -34,4 +34,6 @@ SECTIONS
         *(.bss*)
         . = ALIGN(4K);
     }
+
+    PROVIDE(kernel_end = .);
 }

@@ -17,6 +17,10 @@ extern "C" {
 
 [[noreturn]] void enter_usermode(uint64_t entry, uint64_t user_stack);
 
+/* iretq into an explicit ring3 frame (used by exec/exit to resume a
+   previously saved user context).  Never returns. */
+[[noreturn]] void usermode_resume(uint64_t rip, uint64_t rsp, uint64_t rflags);
+
 #ifdef __cplusplus
 }
 #endif
