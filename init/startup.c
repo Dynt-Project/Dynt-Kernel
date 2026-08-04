@@ -71,6 +71,9 @@ static void launch_userspace(void)
     process_set_current(init);
 
     write_cr3(init->cr3);
+    debug_printf("[boot] ctx rip=0x%lx cs=0x%lx rflags=0x%lx rsp=0x%lx ss=0x%lx\n",
+                 init->ctx.rip, init->ctx.cs, init->ctx.rflags,
+                 init->ctx.user_rsp, init->ctx.ss);
     usermode_resume_full(&init->ctx);
 }
 

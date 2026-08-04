@@ -30,6 +30,9 @@ void scheduler_list(sched_list_cb cb, void *user);
 uint32_t scheduler_process_count(void);
 process_t *scheduler_current(void);
 
+// monotonic tick counter, incremented on every timer irq (100 Hz)
+uint64_t scheduler_ticks(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -12,6 +12,10 @@
 #define PROCESS_USER_STACK_SIZE (256ULL * 1024ULL)
 #define PROCESS_USER_STACK_TOP 0x4000000000ULL
 
+// anonymous user mappings (mlibc malloc arena etc.) grow up from here,
+// well below the user stack and above the PIE base range
+#define PROCESS_MMAP_START 0x1000000000ULL
+
 typedef enum process_state
 {
     PROC_READY,
@@ -26,6 +30,8 @@ typedef struct process
     process_state_t state;
     uint64_t cr3;          // page table root (address space)
     uint64_t ticks;        // ticks consumed on the current slice
+    uint64_t fs_base;      // FS segment base (mlibc TCB), restored on switch
+    uint64_t mmap_cursor;  // bump cursor for anonymous user mappings
     // full saved user context: general registers + the iretq frame
     // (rip/cs/rflags/user_rsp/ss). the scheduler copies the interrupt
     // frame here on preempt and back into the frame on switch-in

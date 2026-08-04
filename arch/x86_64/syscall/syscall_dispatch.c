@@ -10,6 +10,7 @@
 
 #include "../io/serial.h"
 #include "../cpu/cpu.h"
+#include "../cpu/msr.h"
 
 #include "driver/stacks/input/keyboard_stack.h"
 #include "driver/stacks/video/video_stack.h"
@@ -17,13 +18,15 @@
 #include "exec/elf.h"
 #include "mem/mm/kheap.h"
 #include "mem/mm/paging.h"
+#include "mem/mm/pmm.h"
 #include "process/process.h"
 #include "scheduler/scheduler.h"
 #include "init/debug.h"
 
-// user memory lives at PAGING_USER_BASE and up
+// user memory lives at PAGING_USER_BASE and up; the user stack tops out
+// at PROCESS_USER_STACK_TOP (see process/process.h)
 #define USER_MIN PAGING_USER_BASE
-#define USER_MAX (PAGING_USER_BASE + 0x1000000000ULL)
+#define USER_MAX PROCESS_USER_STACK_TOP
 
 static bool user_ptr_ok(const void *ptr, uint64_t len)
 {
@@ -33,8 +36,8 @@ static bool user_ptr_ok(const void *ptr, uint64_t len)
 }
 
 // writes to serial always, VGA understands the ANSI sequences BusyBox
-// sends for clear (\x1b[2J) and cursor home (\x1b[H)
-static void term_write(const char *buf, uint64_t len)
+// sends for clear (\x1b[2J) and cursor home (\x1b[H); returns bytes written
+static uint64_t term_write(const char *buf, uint64_t len)
 {
     enum { T_NORM, T_ESC, T_CSI } state = T_NORM;
 
@@ -78,6 +81,8 @@ static void term_write(const char *buf, uint64_t len)
                 break;
         }
     }
+
+    return len;
 }
 
 typedef struct
@@ -220,12 +225,83 @@ static int32_t sys_ps(char *buf, uint64_t len)
     return (int32_t)pb.used;
 }
 
+// anonymous user mapping for mlibc's malloc arena. the user asks for
+// `len` bytes and gets a page-aligned region below the stack
+static uint64_t sys_mmap(uint64_t len, uint64_t flags)
+{
+    (void)flags;
+    if (len == 0)
+        len = 4096;
+    len = (len + 4095) & ~4095ULL;
+    if (len > 0x40000000ULL)
+        return (uint64_t)-1;
+
+    process_t *cur = process_current();
+    if (!cur)
+        return (uint64_t)-1;
+
+    uint64_t base = cur->mmap_cursor;
+    if (base + len > PROCESS_USER_STACK_TOP)
+        return (uint64_t)-1;
+
+    const uint64_t map_flags = PAGING_FLAG_PRESENT | PAGING_FLAG_WRITABLE |
+                               PAGING_FLAG_USER;
+
+    for (uint64_t va = base; va < base + len; va += 4096)
+    {
+        uintptr_t phys = pmm_alloc_frame();
+        if (!phys)
+        {
+            for (uint64_t v2 = base; v2 < va; v2 += 4096)
+            {
+                pmm_free_frame(paging_translate(cur->cr3, v2));
+                paging_unmap(cur->cr3, v2);
+            }
+            return (uint64_t)-1;
+        }
+        pmm_zero_page(phys);
+        paging_map(cur->cr3, va, phys, map_flags);
+    }
+
+    cur->mmap_cursor = base + len;
+    return base;
+}
+
+static int64_t sys_munmap(uint64_t addr, uint64_t len)
+{
+    len = (len + 4095) & ~4095ULL;
+    if (len == 0 || addr < USER_MIN || addr + len >= PROCESS_USER_STACK_TOP)
+        return -1;
+
+    process_t *cur = process_current();
+    if (!cur)
+        return -1;
+
+    for (uint64_t va = addr; va < addr + len; va += 4096)
+    {
+        uintptr_t phys = paging_translate(cur->cr3, va);
+        if (phys)
+            pmm_free_frame(phys);
+        paging_unmap(cur->cr3, va);
+    }
+    return 0;
+}
+
 void syscall_dispatch(syscall_regs_t *regs) {
+    static uint64_t sc_count;
+    if (sc_count++ < 40)
+        debug_printf("[sc] #%lu no=%lu rdi=0x%lx rsi=0x%lx rdx=0x%lx\n",
+                     sc_count, regs->rax, regs->rdi, regs->rsi, regs->rdx);
     switch (regs->rax) {
 
         case SYS_WRITE:
-            term_write((const char *)regs->rdi, regs->rsi);
-            regs->rax = 0;
+            // Linux ABI: write(fd, buf, count) -> rdi=fd, rsi=buf, rdx=count
+            if (regs->rdi > 2 || !user_ptr_ok((void *)regs->rsi, regs->rdx))
+            {
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+            regs->rax = term_write((const char *)regs->rsi, regs->rdx);
             break;
 
         case SYS_READ:
@@ -286,6 +362,29 @@ void syscall_dispatch(syscall_regs_t *regs) {
         case SYS_PS:
             regs->rax = sys_ps((char *)regs->rdi, regs->rsi);
             break;
+
+        case SYS_MMAP:
+            regs->rax = sys_mmap(regs->rdi, regs->rsi);
+            break;
+
+        case SYS_MUNMAP:
+            regs->rax = sys_munmap(regs->rdi, regs->rsi);
+            break;
+
+        case SYS_GETTICKS:
+            regs->rax = scheduler_ticks();
+            break;
+
+        case SYS_SETFSBASE: {
+            process_t *cur = process_current();
+            if (cur)
+            {
+                cur->fs_base = regs->rdi;
+                wrmsr(MSR_IA32_FS_BASE, regs->rdi);
+            }
+            regs->rax = 0;
+            break;
+        }
 
         case SYS_EXIT:
             scheduler_exit_current();

@@ -22,6 +22,9 @@ typedef struct elf_dynamic
     uint64_t rela_size;    // DT_RELASZ: bytes of relocations
     uint64_t rela_ent;     // DT_RELAENT: size of one entry
     uint64_t rela_count;   // DT_RELACOUNT: leading RELATIVE relocs
+    uint64_t symtab_offset; // file offset of DT_SYMTAB
+    uint64_t strtab_offset; // file offset of DT_STRTAB
+    uint64_t sym_ent;      // DT_SYMENT: size of one symbol
 } elf_dynamic_t;
 
 typedef struct elf_image

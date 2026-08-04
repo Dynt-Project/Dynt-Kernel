@@ -59,6 +59,7 @@ process_t *process_create(const char *name)
     proc->ctx.cs = 0x23;   // ring3 code segment
     proc->ctx.ss = 0x1B;   // ring3 data segment
     proc->ctx.rflags = 0x202;
+    proc->mmap_cursor = PROCESS_MMAP_START;
 
     if (name)
         k_strncpy(proc->name, name, sizeof(proc->name));
@@ -142,8 +143,10 @@ static bool map_user_stack(process_t *proc)
 // relocation types
 #define R_X86_64_64 1
 #define R_X86_64_GLOB_DAT 6
-#define R_X86_64_RELATIVE 8
 #define R_X86_64_JUMP_SLOT 7
+#define R_X86_64_RELATIVE 8
+#define R_X86_64_IRELATIVE 0x24
+#define R_X86_64_IRELATIV 0x25
 
 typedef struct elf64_rela
 {
@@ -151,6 +154,41 @@ typedef struct elf64_rela
     uint64_t r_info;
     int64_t r_addend;
 } elf64_rela_t;
+
+typedef struct elf64_sym
+{
+    uint32_t st_name;
+    uint8_t st_info;
+    uint8_t st_other;
+    uint16_t st_shndx;
+    uint64_t st_value;
+    uint64_t st_size;
+} elf64_sym_t;
+
+// resolves a symbol referenced by a relocation: returns its base-relative
+// virtual address and whether it is defined (SHN_UNDEF means not defined)
+static uint64_t resolve_symbol(const uint8_t *image, size_t size,
+                               const elf_dynamic_t *dyn, uint32_t sym_index,
+                               uint64_t base, bool *defined)
+{
+    *defined = false;
+
+    if (!dyn->symtab_offset || dyn->sym_ent < sizeof(elf64_sym_t))
+        return 0;
+
+    uint64_t off = dyn->symtab_offset + (uint64_t)sym_index * dyn->sym_ent;
+
+    if (off + sizeof(elf64_sym_t) > size)
+        return 0;
+
+    const elf64_sym_t *sym = (const elf64_sym_t *)(image + off);
+
+    if (sym->st_shndx == 0)  // SHN_UNDEF: weakly undefined in a static link
+        return 0;
+
+    *defined = true;
+    return base + sym->st_value;
+}
 
 // applies base-relative relocations from PT_DYNAMIC so a PIE (or a
 // future .so) works without a userspace loader: every RELATIVE slot
@@ -174,15 +212,48 @@ static bool apply_relocations(process_t *proc, const uint8_t *image,
                                                        i * dyn.rela_ent);
 
         uint64_t type = r->r_info & 0xFFFFFFFFULL;
+        uint64_t value = 0;
 
-        if (type != R_X86_64_RELATIVE &&
-            type != R_X86_64_GLOB_DAT &&
-            type != R_X86_64_64)
-            continue;
+        switch (type)
+        {
+            case R_X86_64_RELATIVE:
+                value = base + (uint64_t)r->r_addend;
+                break;
+
+            case R_X86_64_GLOB_DAT:
+            case R_X86_64_JUMP_SLOT:
+            {
+                bool defined;
+                value = resolve_symbol(image, size, &dyn,
+                                       (uint32_t)(r->r_info >> 32), base,
+                                       &defined);
+                if (!defined)
+                    continue;  // leave weakly-undefined slots untouched
+                break;
+            }
+
+            case R_X86_64_64:
+            {
+                bool defined;
+                uint64_t sym = resolve_symbol(image, size, &dyn,
+                                              (uint32_t)(r->r_info >> 32), base,
+                                              &defined);
+                value = sym + (uint64_t)r->r_addend;
+                (void)defined;
+                break;
+            }
+
+            case R_X86_64_IRELATIVE:
+            case R_X86_64_IRELATIV:
+                // IFUNC slots need a running resolver; the Dynt build is
+                // compiled with -fno-ifunc so none should appear
+                continue;
+
+            default:
+                continue;
+        }
 
         uint64_t vaddr = base + r->r_offset;
-        uint64_t value = base + (uint64_t)r->r_addend;
-
         uint64_t phys = paging_translate(proc->cr3, vaddr);
 
         if (!phys)
@@ -252,10 +323,49 @@ bool process_load_elf(process_t *proc, const char *path)
     return true;
 }
 
+// builds a System V x86-64 initial user stack so mlibc's crt1 can read
+// argc/argv/envp/auxv. layout at %rsp on entry:
+//   argc | argv[0] | NULL | envp[0]=NULL | auxv(AT_NULL,0)
 void process_setup(process_t *proc, uint64_t entry, uint64_t stack_top)
 {
+    uint64_t vaddr = stack_top;
+
+    // argv[0] string lives deep inside the mapped stack region
+    uint64_t str_vaddr = stack_top - 0x2000;
+    char *str_k = (char *)paging_translate(proc->cr3, str_vaddr);
+    if (str_k)
+        k_memcpy(str_k, proc->name, k_strlen(proc->name) + 1);
+
+    vaddr -= 16;  // auxv: AT_NULL pair (type = 0, value = 0)
+    uint64_t *aux = (uint64_t *)paging_translate(proc->cr3, vaddr);
+    if (aux)
+    {
+        aux[0] = 0;
+        aux[1] = 0;
+    }
+
+    vaddr -= 8;  // envp terminator
+    uint64_t *envp = (uint64_t *)paging_translate(proc->cr3, vaddr);
+    if (envp)
+        *envp = 0;
+
+    vaddr -= 8;  // argv terminator
+    uint64_t *argv_null = (uint64_t *)paging_translate(proc->cr3, vaddr);
+    if (argv_null)
+        *argv_null = 0;
+
+    vaddr -= 8;  // argv[0] pointer
+    uint64_t *argv = (uint64_t *)paging_translate(proc->cr3, vaddr);
+    if (argv)
+        *argv = str_vaddr;
+
+    vaddr -= 8;  // argc
+    uint64_t *argc = (uint64_t *)paging_translate(proc->cr3, vaddr);
+    if (argc)
+        *argc = 1;
+
     proc->ctx.rip = entry;
-    proc->ctx.user_rsp = stack_top;
+    proc->ctx.user_rsp = vaddr;
     proc->ctx.rflags = 0x202;
 }
 

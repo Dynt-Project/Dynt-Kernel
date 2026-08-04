@@ -30,6 +30,29 @@ SECTIONS
         *(.data*)
     }
 
+    .preinit_array : ALIGN(4K)
+    {
+        __preinit_array_start = .;
+        KEEP (*(.preinit_array))
+        __preinit_array_end = .;
+    }
+
+    .init_array : ALIGN(4K)
+    {
+        __init_array_start = .;
+        KEEP (*(SORT(.init_array.*)))
+        KEEP (*(.init_array))
+        __init_array_end = .;
+    }
+
+    .fini_array : ALIGN(4K)
+    {
+        __fini_array_start = .;
+        KEEP (*(SORT(.fini_array.*)))
+        KEEP (*(.fini_array))
+        __fini_array_end = .;
+    }
+
     .bss : ALIGN(4K)
     {
         *(COMMON)

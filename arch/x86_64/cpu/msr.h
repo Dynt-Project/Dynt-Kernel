@@ -17,6 +17,10 @@
 
 #include <stdint.h>
 
+#define MSR_IA32_FS_BASE 0xC0000100
+#define MSR_IA32_GS_BASE 0xC0000101
+#define MSR_IA32_KERNEL_GS_BASE 0xC0000102
+
 static  inline uint64_t rdmsr(uint32_t reg)
 {
     uint32_t lo, hi;

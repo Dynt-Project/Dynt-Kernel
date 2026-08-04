@@ -37,6 +37,13 @@ struct __attribute__((packed)) syscall_regs_t {
 #define SYS_GETPID    6
 #define SYS_SLEEP     7
 #define SYS_PS        8
+#define SYS_MMAP      9
+#define SYS_MUNMAP    10
+#define SYS_OPEN      11
+#define SYS_CLOSE     12
+#define SYS_SEEK      13
+#define SYS_GETTICKS  14
+#define SYS_SETFSBASE 15
 
 #ifdef __cplusplus
 extern "C" {

@@ -10,6 +10,7 @@
 
 #include "../arch/x86_64/cpu/control_regs.h"
 #include "../arch/x86_64/cpu/cpu.h"
+#include "../arch/x86_64/cpu/msr.h"
 #include "../arch/x86_64/syscall/usermode.h"
 #include "../mem/lib/memory.h"
 
@@ -17,6 +18,12 @@
 
 static process_t *runqueue;
 static uint32_t proc_count;
+static uint64_t uptime_ticks;
+
+uint64_t scheduler_ticks(void)
+{
+    return uptime_ticks;
+}
 
 void scheduler_init(void)
 {
@@ -71,6 +78,8 @@ static process_t *pick_next(process_t *skip)
 
 void scheduler_timer_tick(registers_t *regs)
 {
+    uptime_ticks++;
+
     // only preempt user mode; a syscall or kernel handler must be atomic
     if (regs->cs != 0x23)
         return;
@@ -102,6 +111,7 @@ void scheduler_timer_tick(registers_t *regs)
     process_set_current(next);
 
     write_cr3(next->cr3);
+    wrmsr(MSR_IA32_FS_BASE, next->fs_base);
 
     *regs = next->ctx;
 }
@@ -133,6 +143,7 @@ void scheduler_timer_tick(registers_t *regs)
     process_set_current(next);
 
     write_cr3(next->cr3);
+    wrmsr(MSR_IA32_FS_BASE, next->fs_base);
     usermode_resume_full(&next->ctx);
 }
 

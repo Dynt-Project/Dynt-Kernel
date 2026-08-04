@@ -19,6 +19,9 @@
 #define DT_RELA 7
 #define DT_RELASZ 8
 #define DT_RELAENT 9
+#define DT_SYMTAB 6
+#define DT_STRTAB 5
+#define DT_SYMENT 11
 #define DT_RELACOUNT 0x6FFFFFF9
 #define PF_X 1
 #define PF_W 2
@@ -181,6 +184,28 @@ bool elf64_parse_dynamic(const void *image, size_t size, elf_dynamic_t *out)
 
                 case DT_RELACOUNT:
                     out->rela_count = dyn[d].value;
+                    break;
+
+                case DT_SYMTAB:
+                {
+                    uint64_t off;
+                    if (elf64_vaddr_to_offset(image, size, dyn[d].value,
+                                              &off))
+                        out->symtab_offset = off;
+                    break;
+                }
+
+                case DT_STRTAB:
+                {
+                    uint64_t off;
+                    if (elf64_vaddr_to_offset(image, size, dyn[d].value,
+                                              &off))
+                        out->strtab_offset = off;
+                    break;
+                }
+
+                case DT_SYMENT:
+                    out->sym_ent = dyn[d].value;
                     break;
 
                 default:
