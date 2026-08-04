@@ -1,0 +1,5 @@
+build/
+.idea/
+.vscode/
+*.o
+userspace/bash/main

@@ -19,7 +19,6 @@ KERNEL     := $(BUILD_DIR)/dynt-kernel
 ISO        := $(BUILD_DIR)/dynt-kernel.iso
 FAT_IMG    := $(BUILD_DIR)/fat32.img
 FAT_PART   := $(BUILD_DIR)/fat32-part.img
-USR_INIT   := $(USR_BUILD)/init
 
 CXXFLAGS   := -std=c++20 \
               -ffreestanding \
@@ -43,15 +42,8 @@ LDFLAGS    := -ffreestanding \
               -no-pie \
               -lgcc
 
-# Userspace build flags - PIE so the kernel loader can map each instance
-# at its own base and apply the RELATIVE relocations
-USR_CFLAGS := -nostdlib -ffreestanding -fPIE -fno-stack-protector \
-              -mno-red-zone -O2 -Wall -Wextra -I$(USR_DIR)
-
-USR_LDFLAGS := -nostdlib -pie -T $(USR_DIR)/linker.ld
-
 C_SOURCES  := main.c \
-              $(shell find init driver mem fs process scheduler exec libc $(ARCH) -name "*.c" 2>/dev/null)
+              $(shell find init driver mem fs process scheduler exec $(ARCH) -name "*.c" 2>/dev/null)
 
 ASM_SOURCES:= $(shell find $(ARCH) -name "*.S" 2>/dev/null)
 
@@ -83,18 +75,10 @@ $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(ASFLAGS) -c $< -o $@
 
-# =================== userspace build ===================
+# =================== userspace build (delegates to userspace/Makefile) ===================
 
-userspace: $(USR_INIT)
-
-$(USR_INIT): $(USR_DIR)/busybox.c $(USR_DIR)/linker.ld $(USR_DIR)/syscall.h $(USR_DIR)/string.h $(USR_DIR)/stdio.h
-	@mkdir -p $(USR_BUILD)
-	$(CC) $(USR_CFLAGS) -c $(USR_DIR)/busybox.c -o $(USR_BUILD)/busybox.o
-	$(LD) $(USR_LDFLAGS) -o $@ $(USR_BUILD)/busybox.o
-	@echo ""
-	@echo "==============================="
-	@echo "userspace init built: $(USR_INIT)"
-	@echo "==============================="
+userspace:
+	$(MAKE) -C $(USR_DIR) all
 
 # =================== iso ===================
 
@@ -113,16 +97,21 @@ $(ISO): $(KERNEL) boot/grub/grub.cfg
 
 # =================== fat32 disk image ===================
 
-fat32: $(FAT_IMG)
-
-$(FAT_IMG): $(USR_INIT)
+fat32: userspace
 	@mkdir -p $(BUILD_DIR)
 	@echo "Creating partitioned FAT32 disk image..."
 	# Create the FAT32 partition image (63MB)
 	truncate -s 63M $(FAT_PART)
 	mkfs.fat -F 32 -n DYNTDISK $(FAT_PART)
-	# Copy userspace init program to the partition
-	mcopy -i $(FAT_PART) $(USR_INIT) ::/init
+	# Copy every userspace app onto the partition.
+	# The app named "init" becomes /init, all others /<name>.
+	@for app in $(wildcard $(USR_BUILD)/*/*.elf); do \
+		name=$$(basename $$app .elf); \
+		dst="/$$name"; \
+		if [ "$$name" = "init" ]; then dst="/init"; fi; \
+		mcopy -i $(FAT_PART) "$$app" "::$$dst" && \
+		echo "  copied $$name -> $$dst"; \
+	done
 	# Create the full 64MB disk image
 	truncate -s 64M $(FAT_IMG)
 	# Write MBR partition table (bootable, type 0x0C FAT32 LBA, start sector 2048)
@@ -136,7 +125,7 @@ $(FAT_IMG): $(USR_INIT)
 	@echo "==============================="
 	@echo "fat32 image built: $(FAT_IMG)"
 	@echo "  (MBR partition, 1 partition at sector 2048)"
-	@echo "  (userspace init at /init)"
+	@echo "  (apps copied from build/userspace/*/*.elf)"
 	@echo "==============================="
 
 # =================== run ===================
