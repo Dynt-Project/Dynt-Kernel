@@ -5,13 +5,16 @@
 //   before the "while (true) hlt();" (its also valid to use the io functions from io.h but for main loop its safer to do it this way)
 //   we add the startup function like demostrated
 //     example: startup();
+//modified in some parrty by @epaxgamingtv
 
 #include "init/startup.h"
 #include "arch/x86_64/cpu/cpu.h"
 
-extern "C" void main() {
+void main() {
     
     startup();
+
+    // the window manager takes over the main loop
 
     while (true) hlt(); 
 }

@@ -28,3 +28,7 @@ struct krbootinfo {
     void* rsdp;
     void* smbios;
 };
+
+// the bootloader (currently grub via multiboot2) fills this once at boot,
+// see arch/x86_64/boot/multiboot2.c
+extern krbootinfo g_bootinfo;
