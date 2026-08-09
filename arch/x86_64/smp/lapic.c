@@ -106,6 +106,10 @@ uint32_t lapic_calibrate(void)
 
 void lapic_timer_init(uint32_t count_per_tick)
 {
+    // The INIT/SIPI sequence resets the local APIC to software-disabled
+    // (SVR bit 8 clear); without this no interrupt ever reaches the CPU.
+    // The BSP already did it in lapic_init(), but each AP must too.
+    lapic_write(LAPIC_SVR, lapic_read(LAPIC_SVR) | LAPIC_SVR_ENABLE | 0xFF);
     lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | LVT_TIMER_PERIODIC);
     lapic_write(LAPIC_TIMER_DIV, LAPIC_DIVIDE_1);
     lapic_write(LAPIC_TIMER_INIT, count_per_tick);

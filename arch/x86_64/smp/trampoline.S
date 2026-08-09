@@ -65,9 +65,10 @@ trampoline_32:
     movl TRAMP(trampoline_info) + 8, %eax
     movl %eax, %cr3
 
-    # PAE
+    # PAE | OSFXSR | OSXMMEXCPT (same as start64: APs run user code
+    # that uses SSE, so the OSFXSR/OSXMMEXCPT bits must be set here too)
     movl %cr4, %eax
-    orl $0x20, %eax
+    orl $0x620, %eax
     movl %eax, %cr4
 
     # long mode enable

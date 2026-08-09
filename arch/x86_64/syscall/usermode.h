@@ -27,6 +27,11 @@ extern "C" {
    and enters ring3.  Used by the scheduler on process switch. */
 [[noreturn]] void usermode_resume_full(const registers_t *ctx);
 
+/* resumes a process that was preempted while blocked in a kernel-mode
+   syscall: restores its registers, sets RSP to the captured kernel
+   stack pointer and iretq's back into the hlt loop. Never returns. */
+[[noreturn]] void kernel_resume(const registers_t *ctx, uint64_t rsp);
+
 #ifdef __cplusplus
 }
 #endif

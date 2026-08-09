@@ -1,11 +1,17 @@
 #include "ide.h"
 
+#include "../../../../arch/x86_64/cpu/spinlock.h"
 #include "../../../../arch/x86_64/io/io.h"
 #include "../../../../driver/stacks/storage/block.h"
 #include "../../../../mem/lib/memory.h"
 
 #include <stdbool.h>
 #include <stdint.h>
+
+// IDE channels are shared hardware: two CPUs doing PIO to the same channel
+// at once corrupt the command state.  A single lock serializes all PIO;
+// IRQs are masked while holding it so the busy-wait can't be preempted.
+static spinlock_t ide_io_lock;
 
 #define ATA_PRIMARY_IO 0x1F0
 #define ATA_PRIMARY_CTRL 0x3F6
@@ -145,13 +151,18 @@ static bool ide_pio_access(ide_drive_t *drive,
                            void *buffer)
 {
     uint8_t *bytes = (uint8_t *)buffer;
+    bool ok = true;
+    uint64_t flags = spinlock_acquire_irq(&ide_io_lock);
 
-    while (count)
+    while (count && ok)
     {
         uint8_t chunk = count > 255 ? 255 : (uint8_t)count;
 
         if (!drive->lba48 && (lba + chunk) > 0x10000000ULL)
-            return false;
+        {
+            ok = false;
+            break;
+        }
 
         ide_select_drive(&drive->channel, drive->drive);
 
@@ -180,10 +191,13 @@ static bool ide_pio_access(ide_drive_t *drive,
                           write ? ATA_CMD_WRITE_PIO : ATA_CMD_READ_PIO);
         }
 
-        for (uint32_t sector = 0; sector < chunk; sector++)
+        for (uint32_t sector = 0; sector < chunk && ok; sector++)
         {
             if (!ide_wait(&drive->channel, true))
-                return false;
+            {
+                ok = false;
+                break;
+            }
 
             if (write)
                 outsw((uint16_t)(drive->channel.io + ATA_REG_DATA), bytes, 256);
@@ -193,19 +207,20 @@ static bool ide_pio_access(ide_drive_t *drive,
             bytes += 512;
         }
 
-        if (write)
+        if (ok && write)
         {
             ide_write_reg(&drive->channel, ATA_REG_COMMAND,
                           drive->lba48 ? ATA_CMD_CACHE_FLUSH_EXT : ATA_CMD_CACHE_FLUSH);
             if (!ide_wait(&drive->channel, false))
-                return false;
+                ok = false;
         }
 
         lba += chunk;
         count -= chunk;
     }
 
-    return true;
+    spinlock_release_irq(&ide_io_lock, flags);
+    return ok;
 }
 
 static bool ide_block_read(block_device_t *dev,

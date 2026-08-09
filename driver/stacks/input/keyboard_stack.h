@@ -57,6 +57,13 @@
 #define KEY_LEFT 0x14B
 #define KEY_RIGHT 0x14D
 #define KEY_DOWN 0x150
+#define KEY_C 0x2E
+#define KEY_F1 0x3B
+#define KEY_F2 0x3C
+#define KEY_F3 0x3D
+#define KEY_F4 0x3E
+#define KEY_F5 0x3F
+#define KEY_F6 0x40
 
 typedef struct {
     uint16_t keycode;
@@ -92,17 +99,35 @@ bool keyboard_poll_event(keyboard_event_t *event);
 // preempt a spinning userspace between calls.
 #define TTY_LINE_MAX 256
 
+// one canonical line buffer per virtual terminal; Ctrl+Alt+F1..Fn
+// switches which VT is displayed and which one the keyboard feeds
+#define TTY_VT_MAX 4
+
 // called by keyboard drivers for every pressed key
 void tty_input_char(char c);
 
 // returns a full line (newline stripped, NUL terminated) or 0 if none
-// is ready yet
-int tty_getline(char *buf, int size);
+// is ready yet on the given VT
+int tty_getline(uint8_t vt, char *buf, int size);
 
-// true if a full line is waiting to be consumed
-bool tty_line_ready(void);
+// true if a full line is waiting on the given VT
+bool tty_line_ready(uint8_t vt);
 
-// drains polled COM1 input into the canonical line buffer
+// drains polled COM1 input into the active VT's line buffer
 void tty_drain_serial(void);
+
+// switches the active/displayed terminal (called on Ctrl+Alt+Fn)
+void tty_vt_switch(uint8_t vt);
+
+// the currently active terminal
+uint8_t tty_active_vt(void);
+
+// called by the keyboard driver on Ctrl+C: marks the VT as interrupted
+// and clears a half-typed line (echoes ^C)
+void tty_sigint_trigger(uint8_t vt);
+
+// consumes + clears the interrupt flag of a VT; returns true if a
+// Ctrl+C happened since the last call
+bool tty_sigint_consume(uint8_t vt);
 
 #endif //DYNT_KERNEL_KEYBOARD_STACK_H

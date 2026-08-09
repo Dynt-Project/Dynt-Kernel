@@ -11,9 +11,12 @@
 #include "../io/serial.h"
 #include "../cpu/cpu.h"
 #include "../cpu/msr.h"
+#include "../cpu/control_regs.h"
+#include "../cpu/percpu.h"
 
 #include "driver/stacks/input/keyboard_stack.h"
 #include "driver/stacks/video/video_stack.h"
+#include "driver/buildin/video/vga/vga.h"
 #include "fs/vfs.h"
 #include "exec/elf.h"
 #include "mem/mm/kheap.h"
@@ -36,8 +39,10 @@ static bool user_ptr_ok(const void *ptr, uint64_t len)
 }
 
 // writes to serial always, VGA understands the ANSI sequences BusyBox
-// sends for clear (\x1b[2J) and cursor home (\x1b[H); returns bytes written
-static uint64_t term_write(const char *buf, uint64_t len)
+// sends for clear (\x1b[2J) and cursor home (\x1b[H); returns bytes
+// written. output goes to the given virtual terminal's buffer (each VT
+// runs its own shell), serial is shared by all VTs.
+static uint64_t term_write(uint8_t vt, const char *buf, uint64_t len)
 {
     enum { T_NORM, T_ESC, T_CSI } state = T_NORM;
 
@@ -55,7 +60,7 @@ static uint64_t term_write(const char *buf, uint64_t len)
                 if (c == 0x1b)
                     state = T_ESC;
                 else
-                    video_putc(c);
+                    vga_vt_putc(vt, c);
                 break;
 
             case T_ESC:
@@ -63,8 +68,8 @@ static uint64_t term_write(const char *buf, uint64_t len)
                     state = T_CSI;
                 else
                 {
-                    video_putc(0x1b);
-                    video_putc(c);
+                    vga_vt_putc(vt, 0x1b);
+                    vga_vt_putc(vt, c);
                     state = T_NORM;
                 }
                 break;
@@ -73,9 +78,9 @@ static uint64_t term_write(const char *buf, uint64_t len)
                 if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
                 {
                     if (c == 'J')
-                        video_clear();
+                        vga_vt_clear(vt);
                     else if (c == 'H' || c == 'f')
-                        video_set_cursor(0, 0);
+                        vga_vt_set_cursor(vt, 0, 0);
                     state = T_NORM;
                 }
                 break;
@@ -150,18 +155,26 @@ static int32_t sys_read_file(const char *path, void *buf, uint64_t len)
 
 static void sys_sleep(uint64_t ms)
 {
-    // spin with hlt; a timer irq wakes the cpu each tick, and the timer
-    // handler refuses to preempt kernel mode, so this is a clean wait
-    uint64_t now = 0;
-    uint64_t target = ms / 10;  // ticks at 100 Hz
+    // park in a hlt loop; the timer preempts blocked processes (so other
+    // processes keep running), then this one resumes and re-checks the
+    // deadline. a SYS_KILL against this process aborts the sleep early.
+    process_t *cur = process_current();
+    uint64_t start = scheduler_ticks();
+    uint64_t ticks = ms / 10;  // 100 Hz timer
+    uint64_t deadline = start + ticks;
 
+    if (cur)
+        cur->blocked = true;
     sti();
-    while (now < target)
+    while (scheduler_ticks() < deadline)
     {
+        if (scheduler_terminate_requested())
+            scheduler_exit_current(process_current()->exit_status);
         hlt();
-        now++;
     }
     cli();
+    if (cur)
+        cur->blocked = false;
 }
 
 typedef struct
@@ -172,10 +185,10 @@ typedef struct
 } ps_buf_t;
 
 static void ps_append(uint64_t pid, const char *name, const char *state,
-                      void *user)
+                      uint32_t cpu, void *user)
 {
     ps_buf_t *pb = (ps_buf_t *)user;
-    char line[64];
+    char line[72];
     int n = 0;
 
     uint64_t p = pid;
@@ -192,15 +205,32 @@ static void ps_append(uint64_t pid, const char *name, const char *state,
         line[j] = t;
     }
 
-    line[n++] = ' ';
-
-    for (const char *s = name; *s && n < 40; s++)
-        line[n++] = *s;
-
-    while (n < 40)
+    while (n < 8)
         line[n++] = ' ';
 
-    for (const char *s = state; *s && n < 56; s++)
+    uint32_t c = cpu;
+    do
+    {
+        line[n++] = (char)('0' + c % 10);
+        c /= 10;
+    } while (c && n < 16);
+    for (int i = 8, j = n - 1; i < j; i++, j--)
+    {
+        char t = line[i];
+        line[i] = line[j];
+        line[j] = t;
+    }
+
+    while (n < 16)
+        line[n++] = ' ';
+
+    for (const char *s = state; *s && n < 28; s++)
+        line[n++] = *s;
+
+    while (n < 28)
+        line[n++] = ' ';
+
+    for (const char *s = name; *s && n < 60; s++)
         line[n++] = *s;
 
     line[n++] = '\n';
@@ -298,7 +328,12 @@ void syscall_dispatch(syscall_regs_t *regs) {
                 break;
             }
             if (regs->rdi <= 2)
-                regs->rax = term_write((const char *)regs->rsi, regs->rdx);
+            {
+                process_t *cur = process_current();
+                uint8_t vt = cur ? cur->vt : 0;
+                regs->rax = term_write(vt, (const char *)regs->rsi,
+                                       regs->rdx);
+            }
             else
                 regs->rax = (uint64_t)vfs_write_fd(process_current(),
                                                    (int32_t)regs->rdi,
@@ -326,17 +361,44 @@ void syscall_dispatch(syscall_regs_t *regs) {
             if (fd == 0)
             {
                 // canonical tty read, blocking so a shell/fgets can wait
-                // for a line; keyboard IRQs and serial bytes both wake hlt
+                // for a line on THIS process's virtual terminal. keyboard
+                // IRQs, serial bytes and timer ticks all wake hlt.
+                process_t *cur = process_current();
+                uint8_t vt = cur ? cur->vt : 0;
+
+                if (cur)
+                    cur->blocked = true;
                 sti();
-                do
+#if SCHEDULER_DEBUG
+                debug_printf("[read] pid %lu vt%u krsp=0x%lx\n", cur->pid, vt,
+                             percpu_current()->kernel_rsp);
+#endif
+                for (;;)
                 {
                     tty_drain_serial();
-                    if (tty_line_ready())
+
+                    if (tty_line_ready(vt))
+                    {
+                        regs->rax = (uint64_t)tty_getline(vt, (char *)buf,
+                                                          (int)len);
                         break;
+                    }
+
+                    if (tty_sigint_consume(vt))
+                    {
+                        // Ctrl+C: return -EINTR, a shell reacts to it
+                        regs->rax = (uint64_t)-4;
+                        break;
+                    }
+
+                    if (scheduler_terminate_requested())
+                        scheduler_exit_current(process_current()->exit_status);
+
                     hlt();
-                } while (true);
+                }
                 cli();
-                regs->rax = (uint64_t)tty_getline((char *)buf, (int)len);
+                if (cur)
+                    cur->blocked = false;
             }
             else if (fd >= 3)
                 regs->rax = (uint64_t)vfs_read_fd(process_current(),
@@ -406,6 +468,138 @@ void syscall_dispatch(syscall_regs_t *regs) {
             break;
         }
 
+        case SYS_FORK: {
+            process_t *parent = process_current();
+            process_t *child = process_fork(regs);
+
+            if (!child)
+            {
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+
+            scheduler_enqueue(child);
+#if SCHEDULER_DEBUG
+            debug_printf("[syscall] fork: pid %lu -> pid %lu (cpu %u)\n",
+                         parent ? parent->pid : 0, child->pid,
+                         (unsigned)child->cpu);
+#endif
+            regs->rax = child->pid;
+            break;
+        }
+
+        case SYS_EXECVE: {
+            const char *path = (const char *)regs->rdi;
+            char *const *argv = (char *const *)regs->rsi;
+            char *const *envp = (char *const *)regs->rdx;
+
+            process_t *cur = process_current();
+            if (!cur)
+            {
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+
+            // execve builds a fresh address space and frees the old one,
+            // so the user path buffer must be copied out first
+            char *path_buf = read_user_cstr(cur->cr3, (uint64_t)path);
+            if (!path_buf)
+            {
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+
+            if (!process_execve(cur, path_buf, argv, envp))
+            {
+                kheap_free(path_buf);
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+
+            // process_execve replaced the image and the saved context
+            // (rip/rsp); execve returns via the regular sysret path but
+            // with the new rip/rsp, so it never returns to the caller.
+            // the new image is mapped in a fresh cr3 - switch to it and
+            // reset fs (crt1 re-establishes the TCB on entry).
+            write_cr3(cur->cr3);
+            wrmsr(MSR_IA32_FS_BASE, 0);
+            percpu_current()->kernel_rsp = cur->kernel_stack_top;
+            regs->rcx = cur->ctx.rip;
+            percpu_current()->user_rsp = cur->ctx.user_rsp;
+            regs->rax = 0;
+#if SCHEDULER_DEBUG
+            debug_printf("[syscall] execve pid %lu -> %s\n", cur->pid,
+                         path_buf);
+#endif
+            kheap_free(path_buf);
+            break;
+        }
+
+        case SYS_WAITPID: {
+            process_t *cur = process_current();
+
+            if (!cur)
+            {
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+
+            int64_t want = (int64_t)regs->rdi;   // 0 or negative = any child
+            int32_t *status = (int32_t *)regs->rsi;
+            uint64_t vt = cur->vt;
+
+            cur->blocked = true;
+            sti();
+            for (;;)
+            {
+                process_t *z = process_find_zombie_child(cur, want <= 0 ? 0 : want);
+
+                if (z)
+                {
+                    uint64_t zpid = z->pid;
+                    int32_t st = z->exit_status;
+
+                    if (status && user_ptr_ok(status, 4))
+                        *status = st;
+
+                    process_reap_child(cur, z);
+                    regs->rax = zpid;
+                    break;
+                }
+
+                if (tty_sigint_consume(vt))
+                {
+                    // Ctrl+C while waiting: tell the shell, it kills
+                    // the foreground program itself
+                    regs->rax = (uint64_t)-4;
+                    break;
+                }
+
+                if (scheduler_terminate_requested())
+                    scheduler_exit_current(process_current()->exit_status);
+
+                hlt();
+            }
+            cli();
+            cur->blocked = false;
+            break;
+        }
+
+        case SYS_KILL:
+            scheduler_terminate(regs->rdi);
+            regs->rax = 0;
+            break;
+
+        case SYS_VTSET: {
+            process_t *cur = process_current();
+
+            if (cur)
+                cur->vt = (uint8_t)(regs->rdi & 0xFF);
+
+            regs->rax = 0;
+            break;
+        }
+
         case SYS_GETPID: {
             process_t *cur = process_current();
             regs->rax = cur ? cur->pid : 1;
@@ -444,9 +638,16 @@ void syscall_dispatch(syscall_regs_t *regs) {
             break;
         }
 
-        case SYS_EXIT:
-            scheduler_exit_current();
+        case SYS_EXIT: {
+            process_t *ecur = process_current();
+#if SCHEDULER_DEBUG
+            debug_printf("[exit] pid %lu code=0x%lx\n",
+                         ecur ? ecur->pid : 0, regs->rdi);
+#endif
+            // encode the exit code POSIX-style so waitpid can decode it
+            scheduler_exit_current((regs->rdi & 0xFF) << 8);
             break;
+        }
 
         default:
             serial_write("\n[syscall] UNKNOW, unknown syscall number.\n");

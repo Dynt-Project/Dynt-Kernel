@@ -7,6 +7,7 @@
 #include "pmm.h"
 
 #include "../../arch/x86_64/boot/common/bootinf.h"
+#include "../../arch/x86_64/cpu/spinlock.h"
 #include "../lib/memory.h"
 
 #define PMM_BITMAP_BYTES (PMM_MAX_PHYS / PMM_FRAME_SIZE / 8)  // 2 MiB
@@ -30,6 +31,10 @@ static uint8_t bitmap[PMM_BITMAP_BYTES];
 static uint64_t free_frames;
 static uint64_t total_frames;
 static uint64_t total_memory_bytes;
+
+// the bitmap + hint are shared across cpus (concurrent exec/fork on every
+// core allocates frames), so allocation and freeing must be serialized
+static spinlock_t pmm_lock;
 
 static inline bool frame_is_free(uint64_t idx)
 {
@@ -141,6 +146,7 @@ void pmm_init(void)
 uintptr_t pmm_alloc_frame(void)
 {
     static uint64_t hint;
+    uint64_t flags = spinlock_acquire_irq(&pmm_lock);
 
     for (uint64_t f = hint; f < PMM_MAX_FRAMES; f++)
     {
@@ -149,6 +155,7 @@ uintptr_t pmm_alloc_frame(void)
             frame_mark_used(f);
             free_frames--;
             hint = f + 1;
+            spinlock_release_irq(&pmm_lock, flags);
             return (uintptr_t)(f << 12);
         }
     }
@@ -160,10 +167,12 @@ uintptr_t pmm_alloc_frame(void)
             frame_mark_used(f);
             free_frames--;
             hint = f + 1;
+            spinlock_release_irq(&pmm_lock, flags);
             return (uintptr_t)(f << 12);
         }
     }
 
+    spinlock_release_irq(&pmm_lock, flags);
     return 0;
 }
 
@@ -172,6 +181,7 @@ uintptr_t pmm_alloc_contig(uint64_t count)
     if (count == 0)
         return 0;
 
+    uint64_t flags = spinlock_acquire_irq(&pmm_lock);
     uint64_t run = 0;
     uint64_t start = 0;
 
@@ -189,6 +199,7 @@ uintptr_t pmm_alloc_contig(uint64_t count)
                     frame_mark_used(start + i);
                     free_frames--;
                 }
+                spinlock_release_irq(&pmm_lock, flags);
                 return (uintptr_t)(start << 12);
             }
         }
@@ -198,11 +209,13 @@ uintptr_t pmm_alloc_contig(uint64_t count)
         }
     }
 
+    spinlock_release_irq(&pmm_lock, flags);
     return 0;
 }
 
 void pmm_free_frame(uintptr_t phys)
 {
+    uint64_t flags = spinlock_acquire_irq(&pmm_lock);
     uint64_t f = frame_index(phys);
 
     if (f < PMM_MAX_FRAMES && !frame_is_free(f))
@@ -210,6 +223,8 @@ void pmm_free_frame(uintptr_t phys)
         frame_mark_free(f);
         free_frames++;
     }
+
+    spinlock_release_irq(&pmm_lock, flags);
 }
 
 void pmm_free_range(uintptr_t phys, uint64_t count)

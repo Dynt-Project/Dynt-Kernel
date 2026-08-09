@@ -27,15 +27,26 @@ uint32_t scheduler_least_loaded_cpu(void);
 // work from its own queue.
 void scheduler_timer_tick(registers_t *regs);
 
-// called from SYS_EXIT: kills the current process and resumes the next
-[[noreturn]] void scheduler_exit_current(void);
+// called from SYS_EXIT: kills the current process and resumes the next.
+// if the process has a parent it becomes a zombie (waitable) instead of
+// being destroyed
+[[noreturn]] void scheduler_exit_current(int64_t status);
+
+// requests termination of the process with the given pid (SYS_KILL):
+// sets the terminate flag, the process dies at the next switch/blocking
+// syscall boundary and turns into a zombie for its parent
+bool scheduler_terminate(uint64_t pid);
+
+// true if the calling process has been asked to die; blocking syscall
+// loops call this so a killed process wakes up immediately
+bool scheduler_terminate_requested(void);
 
 // parks the calling cpu (idle loop); the local timer wakes it up and
 // starts any process enqueued on its runqueue
 [[noreturn]] void scheduler_idle_cpu(void);
 
 typedef void (*sched_list_cb)(uint64_t pid, const char *name,
-                              const char *state, void *user);
+                              const char *state, uint32_t cpu, void *user);
 
 // walks every cpu's run queue, calling cb for each live process
 void scheduler_list(sched_list_cb cb, void *user);

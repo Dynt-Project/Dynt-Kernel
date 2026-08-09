@@ -7,7 +7,10 @@
 #include "../inter/isr.h"
 #include "../io/serial.h"
 #include "../cpu/cpu.h"
+#include "../cpu/percpu.h"
 #include "../cpu/control_regs.h"
+#include "../../mem/mm/paging.h"
+#include "../../process/process.h"
 
 static void print_hex64(uint64_t value) {
     static const char digits[] = "0123456789ABCDEF";
@@ -25,6 +28,13 @@ static void print_hex64(uint64_t value) {
     serial_write(buf);
 }
 
+static inline uint64_t read_raw_rsp(void)
+{
+    uint64_t rsp;
+    asm volatile("mov %%rsp, %0" : "=r"(rsp));
+    return rsp;
+}
+
 [[noreturn]] void panic(const char *message, registers_t *regs) {
     cli();
 
@@ -35,7 +45,15 @@ static void print_hex64(uint64_t value) {
     serial_write("\n");
     
     if (regs) {
-        serial_write("vector="); print_hex64(regs->int_no);
+        serial_write("cpu=");
+        print_hex64(percpu_current()->cpu_index);
+        process_t *pc = process_current();
+        if (pc)
+        {
+            serial_write("  pid=");
+            print_hex64(pc->pid);
+        }
+        serial_write("  vector="); print_hex64(regs->int_no);
         serial_write("  err="); print_hex64(regs->err_code);
         serial_write("\n");
 
@@ -63,13 +81,36 @@ static void print_hex64(uint64_t value) {
 
         serial_write("ss="); print_hex64(regs->ss);
         serial_write("  cr3="); print_hex64(read_cr3());
+        serial_write("  rawrsp="); print_hex64(read_raw_rsp());
         serial_write("\n");
 
         serial_write("stack: ");
         const uint64_t *sp = (const uint64_t *)regs->user_rsp;
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < 64; i++) {
+            if (!paging_translate(read_cr3(), regs->user_rsp + i * 8))
+            {
+                serial_write("(unmapped)");
+                break;
+            }
             print_hex64(sp[i]);
             serial_write(" ");
+        }
+        serial_write("\n");
+
+        serial_write("instr: ");
+        const uint8_t *ip = (const uint8_t *)regs->rip;
+        for (int i = 0; i < 16; i++) {
+            if (!paging_translate(read_cr3(), regs->rip + i))
+            {
+                serial_write("(unmapped)");
+                break;
+            }
+            static const char digits[] = "0123456789ABCDEF";
+            char b[3];
+            b[0] = digits[ip[i] >> 4];
+            b[1] = digits[ip[i] & 0xF];
+            b[2] = '\0';
+            serial_write(b);
         }
         serial_write("\n");
     }

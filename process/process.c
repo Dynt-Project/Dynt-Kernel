@@ -10,6 +10,7 @@
 #include "../mem/lib/memory.h"
 #include "../arch/x86_64/cpu/msr.h"
 #include "../arch/x86_64/cpu/percpu.h"
+#include "../arch/x86_64/syscall/syscall.h"
 #include "../init/debug.h"
 
 #define PIE_BASE_MIN PAGING_USER_BASE          // 1 GiB
@@ -340,8 +341,10 @@ bool process_load_elf(process_t *proc, const char *path)
 
     process_setup(proc, base + entry, PROCESS_USER_STACK_TOP);
 
+#if SCHEDULER_DEBUG
     debug_printf("[proc] %s pid=%lu base=0x%lx entry=0x%lx cr3=0x%lx\n",
                  proc->name, proc->pid, base, base + entry, proc->cr3);
+#endif
     return true;
 }
 
@@ -403,9 +406,9 @@ void process_destroy(process_t *proc)
     kheap_free(proc);
 }
 
-// reads a C string from the given address space (current process), up to
-// a reasonable cap. returns a kernel-allocated copy, 0 on unmapped/fault
-static char *read_user_cstr(uint64_t cr3, uint64_t uaddr)
+// reads a C string from the given address space, up to a reasonable cap.
+// returns a kernel-allocated copy, 0 on unmapped/fault
+char *read_user_cstr(uint64_t cr3, uint64_t uaddr)
 {
     char *out = (char *)kheap_alloc(256, 1);
 
@@ -439,33 +442,54 @@ static char *read_user_cstr(uint64_t cr3, uint64_t uaddr)
 static uint64_t build_exec_stack(uint64_t cr3, char *const argv[], int argc,
                                  char *const envp[], int envc, int *out_argc)
 {
-    uint64_t sp = PROCESS_USER_STACK_TOP;
+    uint64_t top = PROCESS_USER_STACK_TOP;
 
-    // strings, starting just below the top of the mapped stack
-    uint64_t arena = sp;
+    // The dynt crt1 does not normalize the stack: _start does
+    // `mov %rsp,%rdi; call __mlibc_entry`, so %rsp must be 0 (mod 16) at
+    // program entry. Layout (highest first): pad slot, envp[] strings,
+    // argv[] strings, auxv pair, envp NULL, envp[], argv NULL, argv[],
+    // argc. The strings live ABOVE %rsp: the new image's rtld runs on the
+    // stack below %rsp and would otherwise overwrite them. mlibc walks
+    // argc, then argv[] (byte-adjacent, then the NULL), then envp[], so
+    // nothing may sit between those slots.
+    uint64_t str_bytes = 0;
+    for (int i = 0; i < envc; i++)
+        str_bytes += (k_strlen(envp[i]) + 1 + 7) & ~0x7ULL;
+    for (int i = 0; i < argc; i++)
+        str_bytes += (k_strlen(argv[i]) + 1 + 7) & ~0x7ULL;
 
+    // argc, argv[], NULL, envp[], NULL, auxv pair: 8*(5+argc+envc) bytes
+    uint64_t total = str_bytes + 8 * (5 + argc + envc);
+    uint64_t pad = (total & 0xF) ? 8 : 0;
+
+    uint64_t str_cur = top - pad;
+    uint64_t env_addr[128];
     for (int i = 0; i < envc; i++)
     {
         uint64_t len = k_strlen(envp[i]) + 1;
-        arena -= len;
-        arena &= ~0xFULL;
-        uint64_t phys = paging_translate(cr3, arena);
+        str_cur -= len;
+        str_cur &= ~0x7ULL;
+        uint64_t phys = paging_translate(cr3, str_cur);
         if (!phys)
             return 0;
         k_memcpy((void *)phys, envp[i], len);
+        env_addr[i] = str_cur;
     }
 
+    uint64_t arg_addr[128];
     for (int i = 0; i < argc; i++)
     {
         uint64_t len = k_strlen(argv[i]) + 1;
-        arena -= len;
-        arena &= ~0xFULL;
-        uint64_t phys = paging_translate(cr3, arena);
+        str_cur -= len;
+        str_cur &= ~0x7ULL;
+        uint64_t phys = paging_translate(cr3, str_cur);
         if (!phys)
             return 0;
         k_memcpy((void *)phys, argv[i], len);
+        arg_addr[i] = str_cur;
     }
 
+    uint64_t sp = str_cur;
     sp -= 16;  // auxv: AT_NULL pair
     uint64_t *aux = (uint64_t *)paging_translate(cr3, sp);
     if (!aux)
@@ -480,13 +504,12 @@ static uint64_t build_exec_stack(uint64_t cr3, char *const argv[], int argc,
     *en = 0;
 
     sp -= 8 * envc;  // envp array
-    uint64_t env_base = sp;
     for (int i = 0; i < envc; i++)
     {
-        uint64_t *e = (uint64_t *)paging_translate(cr3, env_base + i * 8);
+        uint64_t *e = (uint64_t *)paging_translate(cr3, sp + i * 8);
         if (!e)
             return 0;
-        *e = 0;  // filled below
+        *e = env_addr[i];
     }
 
     sp -= 8;  // argv NULL terminator
@@ -496,13 +519,12 @@ static uint64_t build_exec_stack(uint64_t cr3, char *const argv[], int argc,
     *an = 0;
 
     sp -= 8 * argc;  // argv array
-    uint64_t arg_base = sp;
     for (int i = 0; i < argc; i++)
     {
-        uint64_t *a = (uint64_t *)paging_translate(cr3, arg_base + i * 8);
+        uint64_t *a = (uint64_t *)paging_translate(cr3, sp + i * 8);
         if (!a)
             return 0;
-        *a = 0;  // filled below
+        *a = arg_addr[i];
     }
 
     sp -= 8;  // argc
@@ -510,28 +532,6 @@ static uint64_t build_exec_stack(uint64_t cr3, char *const argv[], int argc,
     if (!ac)
         return 0;
     *ac = (uint64_t)argc;
-
-    // walk the arena again to fill argv/envp pointers in order
-    uint64_t cur = arena;
-    for (int i = 0; i < argc; i++)
-    {
-        uint64_t len = k_strlen(argv[i]) + 1;
-        uint64_t *a = (uint64_t *)paging_translate(cr3, arg_base + i * 8);
-        if (!a)
-            return 0;
-        *a = cur;
-        cur += len;
-    }
-
-    for (int i = 0; i < envc; i++)
-    {
-        uint64_t len = k_strlen(envp[i]) + 1;
-        uint64_t *e = (uint64_t *)paging_translate(cr3, env_base + i * 8);
-        if (!e)
-            return 0;
-        *e = cur;
-        cur += len;
-    }
 
     *out_argc = argc;
     return sp;
@@ -624,19 +624,23 @@ bool process_execve(process_t *proc, const char *path, char *const argv[],
     proc->cr3 = new_cr3;
     proc->mmap_cursor = PROCESS_MMAP_START;
 
-    // reset signal/state bits, fs_base (crt1 re-setups the TCB)
+    // reset signal/state bits, fs_base (crt1 re-setups the TCB); the
+    // process stays RUNNING (execve replaces the image of the current
+    // process, it is not requeued)
     proc->fs_base = 0;
-    proc->state = PROC_READY;
+    proc->terminate = false;
     proc->ctx.rip = base + entry;
     proc->ctx.user_rsp = rsp;
     proc->ctx.rflags = 0x202;
 
+#if SCHEDULER_DEBUG
     debug_printf("[proc] %s exec pid=%lu entry=0x%lx rsp=0x%lx cr3=0x%lx\n",
                  proc->name, proc->pid, base + entry, rsp, proc->cr3);
+#endif
     return true;
 }
 
-process_t *process_fork(void)
+process_t *process_fork(const syscall_regs_t *regs)
 {
     process_t *parent = process_current();
     if (!parent)
@@ -656,10 +660,41 @@ process_t *process_fork(void)
     for (int i = 0; i < PROCESS_MAX_FDS; i++)
         child->files[i] = parent->files[i];
 
-    // user context clone: the child appears to return from the fork
-    // syscall with value 0, same registers and same stack
-    child->ctx = parent->ctx;
-    child->ctx.rax = 0;
+    // address-space related state: the cr3 was cloned, so the bump
+    // cursor and fs base (mlibc TCB) must be copied too
+    child->mmap_cursor = parent->mmap_cursor;
+    child->fs_base = parent->fs_base;
+    child->vt = parent->vt;
+
+    // build the child's context from the fork syscall frame: the child
+    // must appear to return from fork() with value 0 at the user rip.
+    // rcx holds the user return rip and r11 the user rflags for sysretq.
+    registers_t ctx;
+    ctx.rax = 0;
+    ctx.rbx = regs->rbx;
+    ctx.rcx = regs->rcx;
+    ctx.rdx = regs->rdx;
+    ctx.rsi = regs->rsi;
+    ctx.rdi = regs->rdi;
+    ctx.rbp = regs->rbp;
+    ctx.r8 = regs->r8;
+    ctx.r9 = regs->r9;
+    ctx.r10 = regs->r10;
+    ctx.r11 = regs->r11;
+    ctx.r12 = regs->r12;
+    ctx.r13 = regs->r13;
+    ctx.r14 = regs->r14;
+    ctx.r15 = regs->r15;
+    ctx.int_no = 0;
+    ctx.err_code = 0;
+    ctx.rip = regs->rcx;  // user return rip (sysretq would jump here)
+    ctx.cs = 0x23;
+    ctx.rflags = regs->r11;
+    ctx.user_rsp = percpu_current()->user_rsp;
+    ctx.ss = 0x1B;
+    child->ctx = ctx;
+
+    process_link_child(parent, child);
 
     // child is enqueued separately (scheduler_enqueue) by the caller
     return child;

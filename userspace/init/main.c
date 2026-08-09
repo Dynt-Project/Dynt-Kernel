@@ -1,36 +1,44 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/wait.h>
 
-void help_command() {
-    printf("avalible commands:\n -help\n -version\n -clear\n");
-}
+// starts one bash instance on every virtual terminal (VT 0..3) and then
+// babysits them. the vt number is passed to bash as argv[1] so each
+// shell knows which terminal it owns. switch terminals with Ctrl+Alt+F1..F4.
+#define BASH_COUNT 4
 
-void version_command() {
-    printf("Dynt-kernel version 1.0.1\n");
-}
+int main(void)
+{
+    printf("Dynt-Kernel init: starting %d terminals...\n", BASH_COUNT);
 
-void clear_command() {
-    printf("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n");
-}
+    for (int i = 0; i < BASH_COUNT; i++)
+    {
+        pid_t pid = fork();
 
-int main(void) {
-    printf("basic stupid shell!\n\n");
-    while (1) {
-        printf("bash: ");
-        char command[500];
+        if (pid == 0)
+        {
+            char num[8];
+            snprintf(num, sizeof(num), "%d", i);
 
-        if (fgets(command, sizeof(command), stdin) != NULL) {
-            if (strchr(command,'help')!=NULL) {
-                help_command();
-            }else if (strchr(command,'version')!=NULL) {
-                version_command();
-            } else if (strchr(command,'clear')!=NULL) {
-                clear_command();
-            }
+            char *argv[3];
+            argv[0] = (char *)"/bash";
+            argv[1] = num;
+            argv[2] = 0;
+
+            char *envp[] = { 0 };
+            execve("/bash", argv, envp);
+
+            printf("init: could not start bash on terminal %d\n", i);
+            for (;;)
+                ;
         }
     }
 
-        //execve("/bash");
+    // reap any bash that dies, start it again on its terminal
+    for (int i = 0; i < BASH_COUNT; i++)
+        waitpid(-1, 0, 0);
+
     return 0;
 }

@@ -34,4 +34,24 @@
 // registers the vga driver in the video stack, returns true on success
 bool vga_register();
 
+// virtual terminals: every VT has its own offscreen text buffer + cursor,
+// so several bash shells can run on one screen. Ctrl+Alt+Fn switches.
+#define VGA_VT_MAX 4
+
+// writes one char to the given VT's buffer (used by the tty syscalls);
+// if the VT is currently displayed the char is also pushed to the screen
+void vga_vt_putc(uint8_t vt, char c);
+
+// clears one VT's buffer
+void vga_vt_clear(uint8_t vt);
+
+// moves the cursor of one VT
+void vga_vt_set_cursor(uint8_t vt, uint16_t x, uint16_t y);
+
+// displays `vt` (copies its buffer to the VGA screen + hardware cursor)
+void vga_vt_switch(uint8_t vt);
+
+// true if `vt` is the one currently shown
+bool vga_vt_displayed(uint8_t vt);
+
 #endif // DYNT_KERNEL_VGA_H

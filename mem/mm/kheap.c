@@ -8,6 +8,7 @@
 #include "kheap.h"
 
 #include "pmm.h"
+#include "../../arch/x86_64/cpu/spinlock.h"
 #include "../lib/memory.h"
 
 #define HEAP_MAGIC 0x484541504B44414EULL  // "NEDPKHEAP"
@@ -27,6 +28,11 @@ typedef struct heap_block
 
 static heap_block_t *heap_head;
 static uint64_t allocated_bytes;
+
+// the free list is shared across cpus (concurrent exec/fork on every core
+// allocates from it), so all heap mutations must be serialized.  Lock
+// order: heap_lock -> pmm_lock (grow_heap -> pmm_alloc_contig).
+static spinlock_t heap_lock;
 
 static inline bool block_free(const heap_block_t *b)
 {
@@ -163,6 +169,8 @@ void *kheap_alloc(size_t size, size_t alignment)
 
     size = (size + 15) & ~(size_t)15;
 
+    uint64_t flags = spinlock_acquire_irq(&heap_lock);
+
     for (int attempt = 0; attempt < 2; attempt++)
     {
         for (heap_block_t *block = heap_head; block; block = block->next)
@@ -202,6 +210,7 @@ void *kheap_alloc(size_t size, size_t alignment)
 
             void *result = (void *)aligned;
             k_memset(result, 0, size);
+            spinlock_release_irq(&heap_lock, flags);
             return result;
         }
 
@@ -209,6 +218,7 @@ void *kheap_alloc(size_t size, size_t alignment)
             break;
     }
 
+    spinlock_release_irq(&heap_lock, flags);
     return 0;
 }
 
@@ -217,17 +227,24 @@ void kheap_free(void *ptr)
     if (!ptr)
         return;
 
+    uint64_t flags = spinlock_acquire_irq(&heap_lock);
+
     heap_block_t *block = (heap_block_t *)((uint8_t *)ptr - HEAP_HEADER);
     block = (heap_block_t *)((uint8_t *)block - block->pad);
 
     if (block->magic != HEAP_MAGIC)
+    {
+        spinlock_release_irq(&heap_lock, flags);
         return;
+    }
 
     if (allocated_bytes >= block->size)
         allocated_bytes -= block->size;
 
     block_set_free(block, true);
     coalesce(block);
+
+    spinlock_release_irq(&heap_lock, flags);
 }
 
 uint64_t kheap_bytes_used(void)

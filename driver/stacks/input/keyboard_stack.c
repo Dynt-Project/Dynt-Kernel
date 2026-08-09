@@ -7,6 +7,8 @@
 
 #include "../../init/debug.h"
 #include "../../arch/x86_64/io/serial.h"
+#include "../video/video_stack.h"
+#include "../../buildin/video/vga/vga.h"
 
 static bool key_state[KEYBOARD_MAX_KEYS];
 
@@ -19,8 +21,7 @@ static keyboard_event_t queue[KEYBOARD_QUE_SIZE];
 static uint32_t head;
 static uint32_t tail;
 
-
-//inits keyboard stack
+// inits keyboard stack
 void keyboard_stack_init()
 {
     for(int i=0;i<KEYBOARD_MAX_KEYS;i++)
@@ -96,6 +97,21 @@ void keyboard_report_key(uint16_t key, bool pressed)
     if (!pressed)
         return;
 
+    // Ctrl+Alt+F1..Fn: switch the active virtual terminal
+    if (ctrl && alt && key >= KEY_F1 && key <= KEY_F6)
+    {
+        tty_vt_switch((uint8_t)(key - KEY_F1));
+        return;
+    }
+
+    // Ctrl+C: interrupt the active terminal (used by bash to stop
+    // the foreground program)
+    if (ctrl && key == KEY_C)
+    {
+        tty_sigint_trigger(tty_active_vt());
+        return;
+    }
+
     if (key == KEY_ENTER)
         tty_input_char('\n');
     else if (key == KEY_BACKSPACE)
@@ -128,72 +144,135 @@ bool keyboard_poll_event(keyboard_event_t *e)
     return true;
 }
 
-/* ---- canonical line input ---- */
+/* ---- canonical line input, one buffer per virtual terminal ---- */
 
-static char tty_line[TTY_LINE_MAX];
-static int tty_len;
-static bool tty_ready;
+typedef struct
+{
+    char line[TTY_LINE_MAX];
+    int len;
+    bool ready;
+    bool sigint;
+} vt_tty_t;
+
+static vt_tty_t vt_tty[TTY_VT_MAX];
+static uint8_t active_vt;
+
+void tty_vt_switch(uint8_t vt)
+{
+    if (vt >= TTY_VT_MAX)
+        return;
+
+    active_vt = vt;
+    vga_vt_switch(vt);
+}
+
+uint8_t tty_active_vt(void)
+{
+    return active_vt;
+}
 
 void tty_input_char(char c)
 {
+    vt_tty_t *t = &vt_tty[active_vt];
+
     // a line is already finished but not consumed yet - don't extend it
-    if (tty_ready)
+    if (t->ready)
         return;
 
     if (c == '\n')
     {
-        if (tty_len < TTY_LINE_MAX - 1)
-            tty_line[tty_len++] = '\n';
-        tty_line[tty_len] = 0;
-        tty_ready = true;
+        if (t->len < TTY_LINE_MAX - 1)
+            t->line[t->len++] = '\n';
+        t->line[t->len] = 0;
+        t->ready = true;
         debug_putc('\n');
         return;
     }
 
     if (c == 0x08 || c == 0x7F)  // backspace
     {
-        if (tty_len > 0)
+        if (t->len > 0)
         {
-            tty_len--;
-            tty_line[tty_len] = 0;
+            t->len--;
+            t->line[t->len] = 0;
             debug_puts("\b \b");
         }
         return;
     }
 
-    if (c >= 0x20 && tty_len < TTY_LINE_MAX - 1)
+    if (c >= 0x20 && t->len < TTY_LINE_MAX - 1)
     {
-        tty_line[tty_len++] = c;
+        t->line[t->len++] = c;
         debug_putc(c);
     }
 }
 
-int tty_getline(char *buf, int size)
+void tty_sigint_trigger(uint8_t vt)
 {
-    if (!tty_ready)
+    if (vt >= TTY_VT_MAX)
+        return;
+
+    vt_tty_t *t = &vt_tty[vt];
+
+    t->sigint = true;
+    t->len = 0;
+    t->line[0] = 0;
+    t->ready = false;
+
+    // echo ^C so the user sees the interrupt
+    debug_puts("^C\n");
+}
+
+bool tty_sigint_consume(uint8_t vt)
+{
+    if (vt >= TTY_VT_MAX)
+        return false;
+
+    vt_tty_t *t = &vt_tty[vt];
+
+    if (t->sigint)
+    {
+        t->sigint = false;
+        return true;
+    }
+
+    return false;
+}
+
+int tty_getline(uint8_t vt, char *buf, int size)
+{
+    if (vt >= TTY_VT_MAX)
         return 0;
 
-    int n = tty_len;
+    vt_tty_t *t = &vt_tty[vt];
+
+    if (!t->ready)
+        return 0;
+
+    int n = t->len;
     if (n > size - 1)
         n = size - 1;
 
     for (int i = 0; i < n; i++)
-        buf[i] = tty_line[i];
+        buf[i] = t->line[i];
 
     buf[n] = 0;
-    tty_len = 0;
-    tty_ready = false;
+    t->len = 0;
+    t->ready = false;
     return n;
 }
 
 // true if a full line is waiting to be consumed
-bool tty_line_ready(void)
+bool tty_line_ready(uint8_t vt)
 {
-    return tty_ready;
+    if (vt >= TTY_VT_MAX)
+        return false;
+
+    return vt_tty[vt].ready;
 }
 
-// drains polled COM1 input into the canonical line buffer so a
-// headless serial console works as stdin without a display/PS2
+// drains polled COM1 input into the active VT's canonical line buffer so
+// a headless serial console works as stdin without a display/PS2
 void tty_drain_serial(void)
 {
     while (serial_received())
@@ -202,7 +281,7 @@ void tty_drain_serial(void)
 
 // translates a scancode set 1 keycode into an ascii char
 // only normal (non extended) keycodes have an ascii representation
-char hid_key_to_ascii(uint16_t keycode,bool shift)
+char hid_key_to_ascii(uint16_t keycode, bool shift)
 {
     static const char normal[0x3A] = {
         0,0,                       '1','2','3','4','5','6','7','8','9','0','-','=',

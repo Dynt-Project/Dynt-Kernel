@@ -47,6 +47,12 @@ USR_CFLAGS   := -nostdlib -ffreestanding -fPIE -fno-stack-protector -mno-red-zon
 		-O2 -Wall -Wextra -D_GNU_SOURCE $(MLIBC_INC)
 USR_CXXFLAGS := $(USR_CFLAGS) -fno-exceptions -fno-rtti -fpermissive
 USR_LDFLAGS  := -nostdlib -pie -T $(LDSCRIPT)
+# frigg declares frg_panic/frg_log as weak in its headers, so the archive
+# member defining them is never pulled in (weak references do not force
+# extraction). Force them undefined so the strong definitions from
+# mlibc's frigg.cpp land in every app; otherwise a user-side frigg
+# assertion calls through a NULL GOT slot and dies in a bare #UD.
+USR_LDFLAGS  += -u frg_panic -u frg_log
 
 .PHONY: all apps mlibc clean
 

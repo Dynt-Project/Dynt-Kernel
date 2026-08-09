@@ -89,4 +89,46 @@ usermode_resume_full:
 
     iretq
 
+# void kernel_resume(const registers_t *ctx, uint64_t rsp)
+# Restores every register from a saved KERNEL-mode context and iretq's
+# back into it with RSP = rsp. Used to resume a process that was
+# preempted while blocked inside a syscall (hlt-loop parked on its own
+# kernel stack). iretq to a kernel target does not pop RSP/SS, so the
+# caller hands us the stack pointer that was live at the interrupt.
+.global kernel_resume
+kernel_resume:
+    mov %rdi, %r10      # ctx
+    mov %rsi, %r9       # target kernel rsp
+
+    mov 0(%r10), %rax
+    mov 8(%r10), %rbx
+    mov 16(%r10), %rcx
+    mov 24(%r10), %rdx
+    mov 32(%r10), %rsi
+    mov 40(%r10), %rdi
+    mov 48(%r10), %rbp
+    mov 56(%r10), %r8
+
+    mov %r9, %rsp       # resume the interrupted stack pointer
+    # A 64-bit iretq pops a 5-qword frame (RIP, CS, RFLAGS, RSP, SS) and
+    # validates the SS selector against the CS RPL even for a same-ring
+    # (kernel->kernel) return, so supply a matching kernel SS (0x10,
+    # RPL 0 == CS RPL 0) and the kernel RSP (krsp) instead of the stale
+    # user-mode fields that would otherwise sit at 160/168.
+    pushq $0x10         # ss
+    pushq %r9           # rsp = krsp
+    pushq 152(%r10)     # rflags
+    pushq 144(%r10)     # cs
+    pushq 136(%r10)     # rip
+
+    mov 80(%r10), %r11
+    mov 88(%r10), %r12
+    mov 96(%r10), %r13
+    mov 104(%r10), %r14
+    mov 112(%r10), %r15
+    mov 64(%r10), %r9
+    mov 72(%r10), %r10
+
+    iretq
+
 .section .note.GNU-stack,"",@progbits

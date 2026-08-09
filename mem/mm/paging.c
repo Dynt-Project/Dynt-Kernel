@@ -185,6 +185,11 @@ bool paging_clone_user_space(uint64_t src_cr3, uint64_t dst_cr3)
                 uint64_t base = ((uint64_t)a << 39) | ((uint64_t)b << 30) |
                                 ((uint64_t)c << 21);
 
+                // the kernel identity half (below PAGING_USER_BASE) is
+                // supervisor and shared; never clone it as user pages
+                if (base < PAGING_USER_BASE)
+                    continue;
+
                 if (spd[c] & PAGING_FLAG_LARGE)
                 {
                     uint64_t srcp = spd[c] & ~0x1FFFFFULL;

@@ -28,6 +28,7 @@ CXXFLAGS   := -std=c++20 \
               -fno-pic \
               -fno-stack-protector \
               -mno-red-zone \
+              -mno-sse -mno-sse2 -mno-mmx -mno-avx -mno-avx2 \
               -mcmodel=large \
               -O2 \
               -Wall \
@@ -135,7 +136,7 @@ fat32: userspace
 # =================== run ===================
 
 run: iso fat32
-	qemu-system-x86_64 -m 1G -smp 4 -cdrom $(ISO) -drive file=$(FAT_IMG),format=raw,if=ide,index=0,media=disk -boot d -serial stdio -no-reboot -no-shutdown
+	qemu-system-x86_64 -m 1G -smp 5 -cdrom $(ISO) -drive file=$(FAT_IMG),format=raw,if=ide,index=0,media=disk -boot d -serial stdio -no-reboot -no-shutdown
 
 # =================== clean ===================
 

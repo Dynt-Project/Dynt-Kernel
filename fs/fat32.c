@@ -12,6 +12,7 @@
 
 static uint8_t fat_sector[512];
 
+
 bool fat32_probe(block_device_t *dev)
 {
     if (!dev || dev->sector_size != 512)

@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "../arch/x86_64/inter/isr.h"
+#include "../arch/x86_64/syscall/syscall.h"
 
 #define PROCESS_NAME_MAX 32
 
@@ -62,6 +63,12 @@ typedef struct process
     struct process *children;
     struct process *next_sibling;
 
+    // virtual terminal this process reads/writes (multi-terminal support)
+    uint8_t vt;
+    bool terminate;        // set by SYS_KILL, honored on next switch/loop
+    bool blocked;          // inside a blocking syscall (hlt loop); the
+                           // timer may preempt a blocked kernel-mode process
+
     // full saved user context: general registers + the iretq frame
     // (rip/cs/rflags/user_rsp/ss). the scheduler copies the interrupt
     // frame here on preempt and back into the frame on switch-in
@@ -93,7 +100,7 @@ bool process_execve(process_t *proc, const char *path, char *const argv[],
 
 // fork clone: copies the address space, file table and user context.
 // returns the child pcb (enqueued nowhere yet) or 0
-process_t *process_fork(void);
+process_t *process_fork(const syscall_regs_t *regs);
 
 // finds a zombie child (pid == 0 means any), 0 if none
 process_t *process_find_zombie_child(process_t *parent, uint64_t pid);
@@ -115,6 +122,11 @@ process_t *process_current(void);
 void process_set_current(process_t *proc);
 
 uint64_t process_next_pid(void);
+
+// reads a C string from `cr3`'s address space into a kernel-allocated
+// buffer (up to 255 bytes); returns 0 if any byte is unmapped or the
+// string does not terminate
+char *read_user_cstr(uint64_t cr3, uint64_t uaddr);
 
 #ifdef __cplusplus
 }

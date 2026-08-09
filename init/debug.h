@@ -13,6 +13,12 @@
 extern "C" {
 #endif
 
+// context-switch / spawn / exec diagnostics ([sw], [res], [wake], [exit],
+// [proc], [read], ...).  set to 1 to re-enable
+#ifndef SCHEDULER_DEBUG
+#define SCHEDULER_DEBUG 0
+#endif
+
 // inits serial, the video stack and the vga driver, call this first
 void debug_init();
 
