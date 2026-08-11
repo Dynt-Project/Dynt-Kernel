@@ -209,6 +209,36 @@ int32_t vfs_stat(const char *path, uint64_t *size, bool *is_dir)
     return 0;
 }
 
+int32_t vfs_mkdir(const char *path)
+{
+    vfs_mount_t *m = vfs_find_mount(path);
+
+    if (!m || !m->fs || !m->fs->mkdir || !path)
+        return -22;  // EINVAL
+
+    const char *rel = strip_mount_prefix(m, path);
+
+    if (!rel || rel[0] == 0)
+        return -22;
+
+    return m->fs->mkdir(m->fs_data, rel);
+}
+
+int32_t vfs_remove(const char *path)
+{
+    vfs_mount_t *m = vfs_find_mount(path);
+
+    if (!m || !m->fs || !m->fs->remove || !path)
+        return -22;  // EINVAL
+
+    const char *rel = strip_mount_prefix(m, path);
+
+    if (!rel || rel[0] == 0)
+        return -22;
+
+    return m->fs->remove(m->fs_data, rel);
+}
+
 /* ---- fd-based file I/O ---- */
 
 int32_t vfs_open_fd(process_t *proc, const char *path, uint32_t flags)

@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 #include "../dynt_syscall.h"
@@ -24,6 +25,8 @@ static void print_help(void)
     printf("Dynt bash - builtin commands:\n");
     printf("  help          show this help\n");
     printf("  clear         clear the screen\n");
+    printf("  mkdir DIR     create a directory\n");
+    printf("  rmdir DIR     delete a directory (and its contents)\n");
     printf("  exit          quit the shell\n");
     printf("everything else: type the name of a program in / to run it,\n");
     printf("e.g.  echo hello   cat /foo   ls   sleep 2\n");
@@ -142,6 +145,26 @@ int main(int argc, char **argv)
         else if (!strcmp(args[0], "clear"))
         {
             printf("\x1b[2J\x1b[H");
+        }
+        else if (!strcmp(args[0], "mkdir"))
+        {
+            if (n < 2)
+            {
+                printf("mkdir: missing directory name\n");
+                continue;
+            }
+            if (mkdir(args[1], 0777) != 0)
+                printf("mkdir: %s: %s\n", args[1], strerror(errno));
+        }
+        else if (!strcmp(args[0], "rmdir"))
+        {
+            if (n < 2)
+            {
+                printf("rmdir: missing directory name\n");
+                continue;
+            }
+            if (rmdir(args[1]) != 0)
+                printf("rmdir: %s: %s\n", args[1], strerror(errno));
         }
         else if (!strcmp(args[0], "exit"))
         {

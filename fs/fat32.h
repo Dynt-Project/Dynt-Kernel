@@ -6,7 +6,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define FAT32_NAME_MAX 13   /* 8.3 + NUL */
+// long file names up to the Windows limit of 255 chars (+ NUL)
+#define FAT32_NAME_MAX 256
 
 typedef struct fat32_ctx
 {
@@ -54,6 +55,11 @@ bool fat32_stat(fat32_ctx_t *ctx, const char *path,
 void fat32_list(fat32_ctx_t *ctx,
                 void (*callback)(const fat32_dirent_t *entry, void *user),
                 void *user);
+// creates a directory; returns 0 on success, a negative errno on failure
+int32_t fat32_mkdir(fat32_ctx_t *ctx, const char *path);
+// deletes a file or an (empty or non-empty) directory tree; returns 0 on
+// success, a negative errno on failure
+int32_t fat32_remove(fat32_ctx_t *ctx, const char *path);
 
 #ifdef __cplusplus
 }

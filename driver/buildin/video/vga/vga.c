@@ -30,6 +30,8 @@ static uint16_t vt_x[VGA_VT_MAX];
 static uint16_t vt_y[VGA_VT_MAX];
 static uint8_t vt_fg[VGA_VT_MAX];
 static uint8_t vt_bg[VGA_VT_MAX];
+static bool vt_reverse[VGA_VT_MAX];
+static bool vt_cursor_visible[VGA_VT_MAX];
 static uint8_t displayed_vt;
 
 static void vga_clear();
@@ -41,6 +43,19 @@ static inline uint16_t vga_cell(char c,
                                 uint8_t color)
 {
     return (uint16_t)c | (uint16_t)color << 8;
+}
+
+// the attribute a VT currently draws new cells with; reverse video swaps
+// foreground and background
+static inline uint8_t vga_attr(uint8_t v)
+{
+    uint8_t fg = vt_fg[v];
+    uint8_t bg = vt_bg[v];
+
+    if (vt_reverse[v])
+        return (uint8_t)(fg << 4 | bg);
+
+    return (uint8_t)(bg << 4 | fg);
 }
 
 
@@ -60,6 +75,10 @@ static void vga_update_cursor()
     uint8_t v = displayed_vt;
     uint16_t pos = vt_y[v] * VGA_COLS + vt_x[v];
 
+    // a hidden cursor is parked in the last cell so it stops blinking
+    if (!vt_cursor_visible[v])
+        pos = VGA_CELLS - 1;
+
     outb(VGA_CRTC, VGA_CURSOR_HIGH);
     outb(VGA_CRTC_DATA, (uint8_t)(pos >> 8));
 
@@ -78,8 +97,7 @@ static void vt_scroll(uint8_t v)
     }
 
     for (uint16_t x = 0; x < VGA_COLS; x++)
-        vt_buf[v][(VGA_ROWS - 1) * VGA_COLS + x] =
-            vga_cell(' ', (uint8_t)(vt_bg[v] << 4 | vt_fg[v]));
+        vt_buf[v][(VGA_ROWS - 1) * VGA_COLS + x] = vga_cell(' ', vga_attr(v));
 }
 
 
@@ -87,7 +105,7 @@ static void vt_scroll(uint8_t v)
 static void vt_clear_impl(uint8_t v)
 {
     for (int i = 0; i < VGA_CELLS; i++)
-        vt_buf[v][i] = vga_cell(' ', (uint8_t)(vt_bg[v] << 4 | vt_fg[v]));
+        vt_buf[v][i] = vga_cell(' ', vga_attr(v));
 
     vt_x[v] = 0;
     vt_y[v] = 0;
@@ -123,13 +141,13 @@ static void vt_putc_impl(uint8_t v, char c)
             {
                 vt_x[v]--;
                 vt_buf[v][vt_y[v] * VGA_COLS + vt_x[v]] =
-                    vga_cell(' ', (uint8_t)(vt_bg[v] << 4 | vt_fg[v]));
+                    vga_cell(' ', vga_attr(v));
             }
             break;
 
         default:
             vt_buf[v][vt_y[v] * VGA_COLS + vt_x[v]] =
-                vga_cell(c, (uint8_t)(vt_bg[v] << 4 | vt_fg[v]));
+                vga_cell(c, vga_attr(v));
             vt_x[v]++;
             break;
     }
@@ -163,6 +181,8 @@ static void vga_init()
     {
         vt_fg[v] = VGA_COLOR_LIGHT_GREY;
         vt_bg[v] = VGA_COLOR_BLACK;
+        vt_reverse[v] = false;
+        vt_cursor_visible[v] = true;
         vt_x[v] = 0;
         vt_y[v] = 0;
         vt_clear_impl((uint8_t)v);
@@ -189,8 +209,7 @@ static void vga_putc_at(uint16_t x,
     if (x >= VGA_COLS || y >= VGA_ROWS)
         return;
 
-    vt_buf[v][y * VGA_COLS + x] =
-        vga_cell(c, (uint8_t)(vt_bg[v] << 4 | vt_fg[v]));
+    vt_buf[v][y * VGA_COLS + x] = vga_cell(c, vga_attr(v));
 
     if (v == displayed_vt)
         VGA_MEMORY[y * VGA_COLS + x] = vt_buf[v][y * VGA_COLS + x];
@@ -280,6 +299,127 @@ void vga_vt_switch(uint8_t vt)
 bool vga_vt_displayed(uint8_t vt)
 {
     return vt == displayed_vt;
+}
+
+void vga_vt_move_cursor(uint8_t vt, int16_t dx, int16_t dy)
+{
+    if (vt >= VGA_VT_MAX)
+        vt = 0;
+
+    int16_t x = (int16_t)vt_x[vt] + dx;
+    int16_t y = (int16_t)vt_y[vt] + dy;
+
+    if (x < 0)
+        x = 0;
+    if (x >= VGA_COLS)
+        x = VGA_COLS - 1;
+    if (y < 0)
+        y = 0;
+    if (y >= VGA_ROWS)
+        y = VGA_ROWS - 1;
+
+    vt_x[vt] = (uint16_t)x;
+    vt_y[vt] = (uint16_t)y;
+
+    if (vt == displayed_vt)
+        vga_update_cursor();
+}
+
+void vga_vt_clear_to_eol(uint8_t vt)
+{
+    if (vt >= VGA_VT_MAX)
+        vt = 0;
+
+    uint16_t attr = vga_attr(vt);
+
+    for (uint16_t x = vt_x[vt]; x < VGA_COLS; x++)
+        vt_buf[vt][vt_y[vt] * VGA_COLS + x] = vga_cell(' ', (uint8_t)attr);
+
+    if (vt == displayed_vt)
+    {
+        vga_flush();
+        vga_update_cursor();
+    }
+}
+
+void vga_vt_clear_line(uint8_t vt)
+{
+    if (vt >= VGA_VT_MAX)
+        vt = 0;
+
+    uint16_t attr = vga_attr(vt);
+
+    for (uint16_t x = 0; x < VGA_COLS; x++)
+        vt_buf[vt][vt_y[vt] * VGA_COLS + x] = vga_cell(' ', (uint8_t)attr);
+
+    if (vt == displayed_vt)
+    {
+        vga_flush();
+        vga_update_cursor();
+    }
+}
+
+void vga_vt_clear_to_escreen(uint8_t vt)
+{
+    if (vt >= VGA_VT_MAX)
+        vt = 0;
+
+    uint16_t attr = vga_attr(vt);
+    uint32_t start = vt_y[vt] * VGA_COLS + vt_x[vt];
+
+    for (uint32_t i = start; i < VGA_CELLS; i++)
+        vt_buf[vt][i] = vga_cell(' ', (uint8_t)attr);
+
+    if (vt == displayed_vt)
+    {
+        vga_flush();
+        vga_update_cursor();
+    }
+}
+
+void vga_vt_set_reverse(uint8_t vt, bool reverse)
+{
+    if (vt >= VGA_VT_MAX)
+        vt = 0;
+
+    vt_reverse[vt] = reverse;
+}
+
+void vga_vt_set_fg_color(uint8_t vt, uint8_t color)
+{
+    if (vt >= VGA_VT_MAX)
+        vt = 0;
+
+    vt_fg[vt] = color;
+}
+
+void vga_vt_set_bg_color(uint8_t vt, uint8_t color)
+{
+    if (vt >= VGA_VT_MAX)
+        vt = 0;
+
+    vt_bg[vt] = color;
+}
+
+void vga_vt_set_cursor_visible(uint8_t vt, bool visible)
+{
+    if (vt >= VGA_VT_MAX)
+        vt = 0;
+
+    vt_cursor_visible[vt] = visible;
+
+    if (vt == displayed_vt)
+        vga_update_cursor();
+}
+
+uint16_t vga_vt_cols(void)
+{
+    return VGA_COLS;
+}
+
+uint16_t vga_vt_rows(void)
+{
+    return VGA_ROWS;
 }
 
 

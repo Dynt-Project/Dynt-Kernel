@@ -35,6 +35,33 @@ int k_memcmp(const void *a, const void *b, size_t size)
     return 0;
 }
 
+// freestanding symbols: GCC emits calls to plain memcpy/memset/memcmp
+// for struct copies and other builtins, which a freestanding kernel
+// must provide itself. the C++-compiled kernel mangles normal names,
+// so keep these C-linkage.
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void *memcpy(void *dst, const void *src, size_t size)
+{
+    return k_memcpy(dst, src, size);
+}
+
+void *memset(void *dst, int value, size_t size)
+{
+    return k_memset(dst, value, size);
+}
+
+int memcmp(const void *a, const void *b, size_t size)
+{
+    return k_memcmp(a, b, size);
+}
+
+#ifdef __cplusplus
+}
+#endif
+
 size_t k_strlen(const char *str)
 {
     size_t len = 0;

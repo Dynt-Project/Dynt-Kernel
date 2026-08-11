@@ -38,13 +38,127 @@ static bool user_ptr_ok(const void *ptr, uint64_t len)
            p + len < USER_MAX;
 }
 
-// writes to serial always, VGA understands the ANSI sequences BusyBox
-// sends for clear (\x1b[2J) and cursor home (\x1b[H); returns bytes
-// written. output goes to the given virtual terminal's buffer (each VT
-// runs its own shell), serial is shared by all VTs.
+// writes to serial always, VGA understands the ANSI sequences Bash/Kilo
+// send (clear \x1b[2J, cursor home \x1b[H, cursor positioning, erase
+// line/screen, SGR colors and reverse video, hide/show cursor); returns
+// bytes written. output goes to the given virtual terminal's buffer
+// (each VT runs its own shell), serial is shared by all VTs.
+
+// SGR foreground color -> VGA palette. VGA has 16 fixed colors.
+static uint8_t sgr_to_vga(int sgr)
+{
+    switch (sgr)
+    {
+        case 30: return 0;   /* black */
+        case 31: return 4;   /* red */
+        case 32: return 2;   /* green */
+        case 33: return 14;  /* yellow */
+        case 34: return 1;   /* blue */
+        case 35: return 5;   /* magenta */
+        case 36: return 3;   /* cyan */
+        case 37: return 7;   /* white */
+        case 90: return 8;   /* bright black */
+        case 91: return 12;  /* bright red */
+        case 92: return 10;  /* bright green */
+        case 93: return 14;  /* bright yellow */
+        case 94: return 9;   /* bright blue */
+        case 95: return 13;  /* bright magenta */
+        case 96: return 11;  /* bright cyan */
+        case 97: return 15;  /* bright white */
+        default: return 0xFF;
+    }
+}
+
+static void csi_apply(uint8_t vt, bool priv, const int *params, int nparams,
+                      char final)
+{
+    int p0 = nparams > 0 && params[0] >= 0 ? params[0] : 0;
+    int p1 = nparams > 1 && params[1] >= 0 ? params[1] : 0;
+
+    if (priv)
+    {
+        // \x1b[?25l / \x1b[?25h: hide/show the hardware cursor
+        if (p0 == 25 && (final == 'l' || final == 'h'))
+            vga_vt_set_cursor_visible(vt, final == 'h');
+        return;
+    }
+
+    switch (final)
+    {
+        case 'H':
+        case 'f':
+        {
+            // cursor position (1-based), default 1;1
+            uint16_t row = (p0 > 0) ? (uint16_t)(p0 - 1) : 0;
+            uint16_t col = (p1 > 0) ? (uint16_t)(p1 - 1) : 0;
+            vga_vt_set_cursor(vt, col, row);
+            break;
+        }
+
+        case 'A':
+            vga_vt_move_cursor(vt, 0, (int16_t)-(p0 > 0 ? p0 : 1));
+            break;
+
+        case 'B':
+            vga_vt_move_cursor(vt, 0, (int16_t)(p0 > 0 ? p0 : 1));
+            break;
+
+        case 'C':
+            vga_vt_move_cursor(vt, (int16_t)(p0 > 0 ? p0 : 1), 0);
+            break;
+
+        case 'D':
+            vga_vt_move_cursor(vt, (int16_t)-(p0 > 0 ? p0 : 1), 0);
+            break;
+
+        case 'J':
+            if (p0 == 2)
+                vga_vt_clear(vt);
+            else
+                vga_vt_clear_to_escreen(vt);
+            break;
+
+        case 'K':
+            if (p0 == 2)
+                vga_vt_clear_line(vt);
+            else
+                vga_vt_clear_to_eol(vt);
+            break;
+
+        case 'm':
+            // SGR; 0 = reset, 7 = reverse video, 30..97 = foreground
+            for (int i = 0; i < nparams; i++)
+            {
+                int p = params[i];
+                if (p < 0)
+                    p = 0;
+                if (p == 0)
+                {
+                    vga_vt_set_reverse(vt, false);
+                    vga_vt_set_fg_color(vt, 7);
+                    vga_vt_set_bg_color(vt, 0);
+                }
+                else if (p == 7)
+                    vga_vt_set_reverse(vt, true);
+                else if (p == 39)
+                    vga_vt_set_fg_color(vt, 7);
+                else
+                {
+                    uint8_t vgac = sgr_to_vga(p);
+                    if (vgac != 0xFF)
+                        vga_vt_set_fg_color(vt, vgac);
+                }
+            }
+            break;
+    }
+}
+
 static uint64_t term_write(uint8_t vt, const char *buf, uint64_t len)
 {
     enum { T_NORM, T_ESC, T_CSI } state = T_NORM;
+    int params[4];
+    int nparams = 0;
+    bool priv = false;
 
     for (uint64_t i = 0; i < len; i++)
     {
@@ -65,7 +179,13 @@ static uint64_t term_write(uint8_t vt, const char *buf, uint64_t len)
 
             case T_ESC:
                 if (c == '[')
+                {
                     state = T_CSI;
+                    nparams = 0;
+                    priv = false;
+                    for (int j = 0; j < 4; j++)
+                        params[j] = -1;
+                }
                 else
                 {
                     vga_vt_putc(vt, 0x1b);
@@ -75,13 +195,37 @@ static uint64_t term_write(uint8_t vt, const char *buf, uint64_t len)
                 break;
 
             case T_CSI:
-                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+                if (c == '?')
                 {
-                    if (c == 'J')
-                        vga_vt_clear(vt);
-                    else if (c == 'H' || c == 'f')
-                        vga_vt_set_cursor(vt, 0, 0);
+                    priv = true;
+                    break;
+                }
+                if (c >= '0' && c <= '9')
+                {
+                    if (nparams < 4)
+                    {
+                        if (params[nparams] < 0)
+                            params[nparams] = 0;
+                        params[nparams] = params[nparams] * 10 + (c - '0');
+                    }
+                    break;
+                }
+                if (c == ';')
+                {
+                    if (nparams < 3)
+                        nparams++;
+                    break;
+                }
+                // any other byte finishes the sequence (ESC is handled
+                // below so a fresh sequence can nest)
+                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    c == 0x1b)
+                {
+                    if (c != 0x1b)
+                        csi_apply(vt, priv, params, nparams + 1, c);
                     state = T_NORM;
+                    if (c == 0x1b)
+                        i--;
                 }
                 break;
         }
@@ -360,11 +504,13 @@ void syscall_dispatch(syscall_regs_t *regs) {
 
             if (fd == 0)
             {
-                // canonical tty read, blocking so a shell/fgets can wait
-                // for a line on THIS process's virtual terminal. keyboard
-                // IRQs, serial bytes and timer ticks all wake hlt.
+                // tty read, blocking so a shell/fgets (canonical) or the
+                // kilo editor (raw) can wait for input on THIS process's
+                // virtual terminal. keyboard IRQs, serial bytes and timer
+                // ticks all wake hlt.
                 process_t *cur = process_current();
                 uint8_t vt = cur ? cur->vt : 0;
+                bool raw = tty_raw_mode(vt);
 
                 if (cur)
                     cur->blocked = true;
@@ -373,28 +519,68 @@ void syscall_dispatch(syscall_regs_t *regs) {
                 debug_printf("[read] pid %lu vt%u krsp=0x%lx\n", cur->pid, vt,
                              percpu_current()->kernel_rsp);
 #endif
-                for (;;)
+                if (raw)
                 {
-                    tty_drain_serial();
+                    // raw mode: return bytes as they arrive. VMIN = how
+                    // many bytes to wait for (0 = any), VTIME = timeout
+                    // in 0.1s units (0 = wait forever).
+                    uint8_t vmin = tty_get_vmin(vt);
+                    uint8_t vtime = tty_get_vtime(vt);
+                    uint64_t deadline = 0;
 
-                    if (tty_line_ready(vt))
+                    if (vtime > 0)
+                        deadline = scheduler_ticks() + (uint64_t)vtime * 10;
+
+                    for (;;)
                     {
-                        regs->rax = (uint64_t)tty_getline(vt, (char *)buf,
-                                                          (int)len);
-                        break;
-                    }
+                        tty_drain_serial();
 
-                    if (tty_sigint_consume(vt))
+                        uint32_t avail = tty_raw_available(vt);
+
+                        if (avail > 0 && (vmin == 0 || avail >= vmin))
+                        {
+                            regs->rax = (uint64_t)tty_read_raw(vt, buf,
+                                                               (uint32_t)len);
+                            break;
+                        }
+
+                        if (vtime > 0 && scheduler_ticks() >= deadline)
+                        {
+                            regs->rax = 0;
+                            break;
+                        }
+
+                        if (scheduler_terminate_requested())
+                            scheduler_exit_current(process_current()->exit_status);
+
+                        hlt();
+                    }
+                }
+                else
+                {
+                    for (;;)
                     {
-                        // Ctrl+C: return -EINTR, a shell reacts to it
-                        regs->rax = (uint64_t)-4;
-                        break;
+                        tty_drain_serial();
+
+                        if (tty_line_ready(vt))
+                        {
+                            regs->rax = (uint64_t)tty_getline(vt, (char *)buf,
+                                                              (int)len);
+                            break;
+                        }
+
+                        if (tty_sigint_consume(vt))
+                        {
+                            // Ctrl+C: return -EINTR, a shell reacts to it
+                            regs->rax = (uint64_t)-4;
+                            break;
+                        }
+
+                        if (scheduler_terminate_requested())
+                            scheduler_exit_current(process_current()->exit_status);
+
+                        hlt();
                     }
-
-                    if (scheduler_terminate_requested())
-                        scheduler_exit_current(process_current()->exit_status);
-
-                    hlt();
                 }
                 cli();
                 if (cur)
@@ -597,6 +783,82 @@ void syscall_dispatch(syscall_regs_t *regs) {
                 cur->vt = (uint8_t)(regs->rdi & 0xFF);
 
             regs->rax = 0;
+            break;
+        }
+
+        case SYS_TCGETATTR: {
+            process_t *cur = process_current();
+            uint8_t vt = cur ? cur->vt : 0;
+            dynt_termios_t *out = (dynt_termios_t *)regs->rdi;
+
+            if (!user_ptr_ok(out, sizeof(dynt_termios_t)))
+            {
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+
+            tty_get_mode(vt, out);
+            regs->rax = 0;
+            break;
+        }
+
+        case SYS_TCSETATTR: {
+            process_t *cur = process_current();
+            uint8_t vt = cur ? cur->vt : 0;
+            dynt_termios_t *in = (dynt_termios_t *)regs->rdi;
+
+            if (!user_ptr_ok(in, sizeof(dynt_termios_t)))
+            {
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+
+            tty_set_mode(vt, in);
+            regs->rax = 0;
+            break;
+        }
+
+        case SYS_TTYWINSIZE: {
+            // returns the virtual terminal geometry as rows;cols, 16-bit
+            // each, which mlibc maps into struct winsize for tcgetwinsize()
+            uint32_t *out = (uint32_t *)regs->rdi;
+
+            if (!user_ptr_ok(out, 4))
+            {
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+
+            uint32_t packed = ((uint32_t)vga_vt_rows() << 16) |
+                              vga_vt_cols();
+            *out = packed;
+            regs->rax = 0;
+            break;
+        }
+
+        case SYS_MKDIR: {
+            const char *path = (const char *)regs->rdi;
+
+            if (!user_ptr_ok(path, 1))
+            {
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+
+            regs->rax = (uint64_t)vfs_mkdir(path);
+            break;
+        }
+
+        case SYS_REMOVE: {
+            const char *path = (const char *)regs->rdi;
+
+            if (!user_ptr_ok(path, 1))
+            {
+                regs->rax = (uint64_t)-1;
+                break;
+            }
+
+            regs->rax = (uint64_t)vfs_remove(path);
             break;
         }
 

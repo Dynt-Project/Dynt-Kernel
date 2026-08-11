@@ -65,6 +65,13 @@
 #define KEY_F5 0x3F
 #define KEY_F6 0x40
 
+// extended (0xE0) navigation keys, scancode set 1
+#define KEY_HOME 0x147
+#define KEY_PAGE_UP 0x149
+#define KEY_END 0x14F
+#define KEY_PAGE_DOWN 0x151
+#define KEY_DELETE 0x153
+
 typedef struct {
     uint16_t keycode;
     char ascii;
@@ -103,6 +110,32 @@ bool keyboard_poll_event(keyboard_event_t *event);
 // switches which VT is displayed and which one the keyboard feeds
 #define TTY_VT_MAX 4
 
+// raw byte queue per VT, used when a process puts the terminal in raw
+// mode (ICANON off) - e.g. the kilo editor
+#define TTY_RAW_MAX 256
+
+// termios c_lflag bits, mirrored from userspace abi-bits/termios.h
+#define TTY_LFLAG_ISIG    0x0000001
+#define TTY_LFLAG_ICANON  0x0000002
+#define TTY_LFLAG_ECHO    0x0000010
+
+// indices into the termios c_cc array (same values as userspace)
+#define TTY_CC_VMIN  6
+#define TTY_CC_VTIME 5
+
+// kernel-side termios, shared over the SYS_TCGETATTR/SYS_TCSETATTR
+// syscalls. the userspace mlibc sysdeps translate between this and the
+// full struct termios layout.
+typedef struct
+{
+    uint32_t c_iflag;
+    uint32_t c_oflag;
+    uint32_t c_cflag;
+    uint32_t c_lflag;
+    uint8_t  c_line;
+    uint8_t  c_cc[32];
+} dynt_termios_t;
+
 // called by keyboard drivers for every pressed key
 void tty_input_char(char c);
 
@@ -129,5 +162,26 @@ void tty_sigint_trigger(uint8_t vt);
 // consumes + clears the interrupt flag of a VT; returns true if a
 // Ctrl+C happened since the last call
 bool tty_sigint_consume(uint8_t vt);
+
+// ---- raw mode (termios) ----
+
+// stores a termios for the VT and applies it (flushes pending input)
+void tty_set_mode(uint8_t vt, const dynt_termios_t *t);
+
+// copies the VT's current termios out
+void tty_get_mode(uint8_t vt, dynt_termios_t *out);
+
+// true if the VT runs in raw mode (ICANON cleared)
+bool tty_raw_mode(uint8_t vt);
+
+// number of unread raw bytes on the VT
+uint32_t tty_raw_available(uint8_t vt);
+
+// drains up to len raw bytes into buf, returns the count
+uint32_t tty_read_raw(uint8_t vt, void *buf, uint32_t len);
+
+// the current VMIN / VTIME (0.1s units) control chars of the VT
+uint8_t tty_get_vmin(uint8_t vt);
+uint8_t tty_get_vtime(uint8_t vt);
 
 #endif //DYNT_KERNEL_KEYBOARD_STACK_H

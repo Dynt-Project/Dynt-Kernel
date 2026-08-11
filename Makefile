@@ -117,6 +117,8 @@ fat32: userspace
 		mcopy -i $(FAT_PART) "$$app" "::$$dst" && \
 		echo "  copied $$name -> $$dst"; \
 	done
+
+	mcopy -i $(FAT_PART) test.txt ::/
 	# Create the full 64MB disk image
 	truncate -s 64M $(FAT_IMG)
 	# Write MBR partition table (bootable, type 0x0C FAT32 LBA, start sector 2048)

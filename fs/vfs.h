@@ -45,6 +45,8 @@ typedef void (*vfs_list_dir_fn)(void *ctx, const char *path,
                                                  bool is_dir,
                                                  void *user),
                                 void *user);
+typedef int32_t (*vfs_mkdir_fn)(void *ctx, const char *path);
+typedef int32_t (*vfs_remove_fn)(void *ctx, const char *path);
 
 typedef struct vfs_fs_type
 {
@@ -57,6 +59,8 @@ typedef struct vfs_fs_type
     vfs_read_at_fn read_at;
     vfs_write_at_fn write_at;
     vfs_list_dir_fn list_dir;
+    vfs_mkdir_fn mkdir;
+    vfs_remove_fn remove;
     struct vfs_fs_type *next;
 } vfs_fs_type_t;
 
@@ -99,6 +103,10 @@ int64_t vfs_seek_fd(process_t *proc, int32_t fd, int64_t off,
                     uint32_t whence);
 int32_t vfs_close_fd(process_t *proc, int32_t fd);
 int32_t vfs_stat(const char *path, uint64_t *size, bool *is_dir);
+
+// negative return values are errno values (e.g. -2 = ENOENT)
+int32_t vfs_mkdir(const char *path);
+int32_t vfs_remove(const char *path);
 
 #ifdef __cplusplus
 }
